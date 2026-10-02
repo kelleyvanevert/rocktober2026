@@ -4,6 +4,8 @@
 
 sample("kick.mp3").fit(500ms).repeat(inf).play
 
+sample("kick.mp3").delay(12s).play
+
 seq(
   sample("kick.mp3").fit(250ms),
   sample("kick.mp3").fit(125ms).repeat(2),
@@ -25,13 +27,14 @@ add(
   sample("recordings/2026-08-31 Airplane bark.m4a", 0:8, 0:9).fit(650ms).repeat(inf)
 ).play
 
-sample("recordings/2026-10-02 Silje 2.m4a", 0:59, 1:01).reverb("cathedral").play
 
-sample("recordings/2026-10-02 Silje 2.m4a", 1:10:688, 1:15:500).reverb("dark_room").play
 
 
 sample("recordings/2026-10-02 Silje 3.m4a", 0:06:500, 0:16:500).reverb("cathedral").play
 
 sample("recordings/2026-09-25 Gong sound 2.m4a", 0:08:672).fit(150ms).gain(-12db).repeat(inf).reverb("cathedral").play
-
 sample("recordings/2026-08-31 Airplane bark.m4a", 0:8, 0:9).repeat(inf).play
+
+sample("recordings/2026-10-02 Silje 2.m4a", 0:59, 1:01).reverb("cathedral").play
+
+sample("recordings/2026-10-02 Silje 2.m4a", 1:10:688, 1:15:500).reverb("dark_room").play

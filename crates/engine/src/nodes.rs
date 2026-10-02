@@ -380,6 +380,43 @@ impl Node for Seq {
     }
 }
 
+/// Silence for `frames`, then its child.
+pub struct Delay {
+    child: Box<dyn Node>,
+    frames: usize,
+    pos: usize,
+}
+
+impl Delay {
+    pub fn new(child: Box<dyn Node>, frames: usize) -> Self {
+        Self {
+            child,
+            frames,
+            pos: 0,
+        }
+    }
+}
+
+impl Node for Delay {
+    fn process(&mut self, out: &mut [Frame]) -> usize {
+        let silent = (self.frames - self.pos).min(out.len());
+        out[..silent].fill([0.0; 2]);
+        self.pos += silent;
+        silent + self.child.process(&mut out[silent..])
+    }
+
+    fn reset(&mut self) {
+        self.child.reset();
+        self.pos = 0;
+    }
+
+    fn skip(&mut self, frames: usize) -> usize {
+        let silent = (self.frames - self.pos).min(frames);
+        self.pos += silent;
+        silent + self.child.skip(frames - silent)
+    }
+}
+
 /// Multiplies its child by a constant.
 pub struct Gain {
     child: Box<dyn Node>,
@@ -694,6 +731,15 @@ mod tests {
         a.process(&mut buf);
         assert_eq!(buf[0][0], 150.0);
         assert_eq!(a.skip(10_000), 149);
+    }
+
+    #[test]
+    fn delay_waits_first() {
+        let left: Vec<f32> = render(&mut Delay::new(constant(0.5, 3), 9))
+            .iter()
+            .map(|f| f[0])
+            .collect();
+        assert_eq!(left, [[0.0; 9].as_slice(), &[0.5; 3]].concat());
     }
 
     #[test]

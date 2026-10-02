@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::engine::Command;
 use crate::lang::{Error, Expr, Spanned};
-use crate::nodes::{Add, Fit, Gain, Limit, Node, Repeat, SampleData, Sampler, Seq, Slice};
+use crate::nodes::{Add, Delay, Fit, Gain, Limit, Node, Repeat, SampleData, Sampler, Seq, Slice};
 use crate::reverb::{self, Impulse, MAX_IR_SECONDS, Reverb};
 use crate::sample;
 
@@ -32,6 +32,7 @@ const REVERB_MIX: f64 = 0.3;
 pub enum Sound {
     Sample(Arc<SampleData>),
     Fit(Box<Sound>, f64),
+    Delay(Box<Sound>, f64),
     /// Start and end, in seconds.
     Slice(Box<Sound>, f64, f64),
     Repeat(Box<Sound>, usize),
@@ -59,6 +60,9 @@ impl Sound {
                 frames(*end) - frames(*start),
                 frames(FIT_FADE_SECONDS),
             )),
+            Sound::Delay(child, seconds) => {
+                Box::new(Delay::new(child.instantiate(sample_rate), frames(*seconds)))
+            }
             Sound::Repeat(child, times) => {
                 Box::new(Repeat::new(child.instantiate(sample_rate), *times))
             }
@@ -165,7 +169,7 @@ impl Evaluator {
             "stop" => (0, 0),
             "play" => (1, 1),
             "sample" => (1, 3),
-            "fit" | "repeat" | "gain" => (2, 2),
+            "fit" | "repeat" | "gain" | "delay" => (2, 2),
             "slice" => (3, 3),
             "limit" => (1, 2),
             "reverb" => (2, 3),
@@ -239,6 +243,12 @@ impl Evaluator {
             ("slice", [v, ..]) => wrong(v, "a sound", 0),
 
             // `repeat(inf)` repeats forever (well, usize::MAX times).
+            ("delay", [Value::Sound(s), Value::Duration(d)]) => {
+                sound(Sound::Delay(Box::new(s.clone()), *d))
+            }
+            ("delay", [Value::Sound(_), v]) => wrong(v, "a duration (like 12s)", 1),
+            ("delay", [v, _]) => wrong(v, "a sound", 0),
+
             ("repeat", [Value::Sound(s), Value::Num(n)])
                 if *n == f64::INFINITY || (*n >= 0.0 && n.fract() == 0.0) =>
             {
