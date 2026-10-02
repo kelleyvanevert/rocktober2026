@@ -25,3 +25,10 @@ ARCHITECTURE
         - Sampler
         - Fit
         - Repeat
+
+Nest steps:
+
+    - Timestamped commands ("play ... at time T")
+    - Voice IDs, so you can stop or change specific running sounds.
+    - A shared clock and tempo, so that 500ms can become beats.
+    - Better resampling with the rubato crate, instead of the current simple interpolation.
