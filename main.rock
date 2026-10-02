@@ -2,7 +2,7 @@
 -- cmd-shift-enter run everything
 -- cmd-.           stop all sound
 
-sample("kick.mp3").fit(500ms).play
+sample("kick.mp3").fit(500ms).repeat(inf).play
 
 seq(
   sample("kick.mp3").fit(250ms),
@@ -10,8 +10,28 @@ seq(
 ).repeat(2).play
 
 add(
-  sample("kick.mp3").gain(-12db).fit(500ms).repeat(4),
-  sample("kick.mp3").gain(-6db).fit(500ms).repeat(4),
-).limit.play
+  sample("kick.mp3").gain(-12db).fit(500ms).repeat(inf),
+  sample("kick.mp3").gain(-6db).fit(200ms).repeat(inf),
+)
+  .reverb(sample("kick.mp3")).limit.play
 
-sample("recordings/2026-08-29 Big dinner.m4a", 0:11:188, 0:12:625).play
+sample("recordings/2026-08-29 Big dinner.m4a", 0:11:188, 0:12:625)
+  .play
+
+sample("recordings/2026-08-31 Airplane.m4a", 0:28, 0:32).play
+
+add(
+  sample("recordings/2026-09-25 Gong sound 2.m4a", 0:08:672).fit(150ms).repeat(inf).reverb("cathedral"),
+  sample("recordings/2026-08-31 Airplane bark.m4a", 0:8, 0:9).fit(650ms).repeat(inf)
+).play
+
+sample("recordings/2026-10-02 Silje 2.m4a", 0:59, 1:01).reverb("cathedral").play
+
+sample("recordings/2026-10-02 Silje 2.m4a", 1:10:688, 1:15:500).reverb("dark_room").play
+
+
+sample("recordings/2026-10-02 Silje 3.m4a", 0:06:500, 0:16:500).reverb("cathedral").play
+
+sample("recordings/2026-09-25 Gong sound 2.m4a", 0:08:672).fit(150ms).gain(-12db).repeat(inf).reverb("cathedral").play
+
+sample("recordings/2026-08-31 Airplane bark.m4a", 0:8, 0:9).repeat(inf).play

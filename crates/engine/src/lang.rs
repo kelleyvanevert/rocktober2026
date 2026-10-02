@@ -169,7 +169,11 @@ fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
-                tokens.push((Token::Ident(src[start..i].to_string()), start));
+                let tok = match &src[start..i] {
+                    "inf" => Token::Num(f64::INFINITY),
+                    name => Token::Ident(name.to_string()),
+                };
+                tokens.push((tok, start));
             }
             _ => {
                 let ch = src[i..].chars().next().unwrap();
@@ -375,6 +379,11 @@ mod tests {
         assert_eq!(times, [11.188, 62.0, 30.5, 600.005]);
         assert!(parse("f(1:2:3:4)").is_err());
         assert!(parse("f(-1:00)").is_err());
+    }
+
+    #[test]
+    fn inf_is_a_number() {
+        assert_eq!(desugar("x().repeat(inf)"), "repeat(x(), inf)");
     }
 
     #[test]

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crate::engine::Command;
 use crate::lang::{Error, Expr, Spanned};
 use crate::nodes::{Add, Fit, Gain, Limit, Node, Repeat, SampleData, Sampler, Seq, Slice};
+use crate::reverb::{self, Impulse, MAX_IR_SECONDS, Reverb};
 use crate::sample;
 
 /// Fade-out applied where `fit` cuts a sound off. A few ms is enough to remove the
@@ -24,6 +25,9 @@ const LIMIT_CEILING: f64 = 0.891;
 const LIMIT_LOOKAHEAD_SECONDS: f64 = 0.005;
 const LIMIT_RELEASE_SECONDS: f64 = 0.1;
 
+/// Default `reverb` wet/dry mix.
+const REVERB_MIX: f64 = 0.3;
+
 #[derive(Clone)]
 pub enum Sound {
     Sample(Arc<SampleData>),
@@ -35,6 +39,8 @@ pub enum Sound {
     Seq(Vec<Sound>),
     Gain(f64, Box<Sound>),
     Limit(f64, Box<Sound>),
+    /// Impulse response and wet/dry mix.
+    Reverb(Box<Sound>, Arc<Impulse>, f64),
 }
 
 impl Sound {
@@ -71,6 +77,11 @@ impl Sound {
             Sound::Gain(amount, child) => {
                 Box::new(Gain::new(*amount as f32, child.instantiate(sample_rate)))
             }
+            Sound::Reverb(child, impulse, mix) => Box::new(Reverb::new(
+                child.instantiate(sample_rate),
+                impulse.clone(),
+                *mix as f32,
+            )),
             Sound::Limit(ceiling, child) => Box::new(Limit::new(
                 child.instantiate(sample_rate),
                 *ceiling as f32,
@@ -112,6 +123,8 @@ pub struct Evaluator {
     /// also guarantees the last reference to a sample is never dropped on the
     /// audio thread.
     cache: HashMap<(PathBuf, Window), Arc<SampleData>>,
+    /// Prepared preset impulse responses, by name.
+    spaces: HashMap<String, Arc<Impulse>>,
 }
 
 impl Evaluator {
@@ -120,6 +133,7 @@ impl Evaluator {
             sample_rate,
             sample_dirs,
             cache: HashMap::new(),
+            spaces: HashMap::new(),
         }
     }
 
@@ -154,6 +168,7 @@ impl Evaluator {
             "fit" | "repeat" | "gain" => (2, 2),
             "slice" => (3, 3),
             "limit" => (1, 2),
+            "reverb" => (2, 3),
             "add" | "seq" => (0, usize::MAX),
             _ => return fail(format!("unknown function '{name}'")),
         };
@@ -223,10 +238,18 @@ impl Evaluator {
             ("slice", [Value::Sound(_), v, _]) => wrong(v, "a start time (like 0:11:188)", 1),
             ("slice", [v, ..]) => wrong(v, "a sound", 0),
 
-            ("repeat", [Value::Sound(s), Value::Num(n)]) if *n >= 0.0 && n.fract() == 0.0 => {
-                sound(Sound::Repeat(Box::new(s.clone()), *n as usize))
+            // `repeat(inf)` repeats forever (well, usize::MAX times).
+            ("repeat", [Value::Sound(s), Value::Num(n)])
+                if *n == f64::INFINITY || (*n >= 0.0 && n.fract() == 0.0) =>
+            {
+                let times = if n.is_infinite() {
+                    usize::MAX
+                } else {
+                    *n as usize
+                };
+                sound(Sound::Repeat(Box::new(s.clone()), times))
             }
-            ("repeat", [Value::Sound(_), v]) => wrong(v, "a whole number", 1),
+            ("repeat", [Value::Sound(_), v]) => wrong(v, "a whole number or inf", 1),
             ("repeat", [v, _]) => wrong(v, "a sound", 0),
 
             ("add" | "seq", _) => {
@@ -256,6 +279,32 @@ impl Evaluator {
             ("limit", [Value::Sound(_), v]) => wrong(v, "a positive ceiling (like 0.9 or -1db)", 1),
             ("limit", [v, ..]) => wrong(v, "a sound", 0),
 
+            ("reverb", [Value::Sound(s), space, rest @ ..]) => {
+                let mix = match rest.first() {
+                    None => REVERB_MIX,
+                    Some(Value::Num(m)) if (0.0..=1.0).contains(m) => *m,
+                    Some(v) => return wrong(v, "a mix between 0 and 1", 2),
+                };
+                let impulse = match space {
+                    Value::Str(name) => match self.space(name) {
+                        Some(impulse) => impulse,
+                        None => {
+                            let names = reverb::preset_names().join(", ");
+                            return Err(Error {
+                                pos: args[1].pos,
+                                msg: format!(
+                                    "reverb: unknown space \"{name}\" (try {names}, or a sound)"
+                                ),
+                            });
+                        }
+                    },
+                    Value::Sound(ir) => Arc::new(Impulse::new(self.render(ir, MAX_IR_SECONDS))),
+                    v => return wrong(v, "a space name or a sound", 1),
+                };
+                sound(Sound::Reverb(Box::new(s.clone()), impulse, mix))
+            }
+            ("reverb", [v, ..]) => wrong(v, "a sound", 0),
+
             ("play", [Value::Sound(s)]) => {
                 commands.push(Command::Play(s.instantiate(self.sample_rate)));
                 Ok(Value::Nothing)
@@ -268,6 +317,35 @@ impl Evaluator {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// A preset space's impulse response, synthesized on first use.
+    fn space(&mut self, name: &str) -> Option<Arc<Impulse>> {
+        if let Some(impulse) = self.spaces.get(name) {
+            return Some(impulse.clone());
+        }
+        let impulse = Arc::new(Impulse::new(reverb::preset(name, self.sample_rate)?));
+        self.spaces.insert(name.to_string(), impulse.clone());
+        Some(impulse)
+    }
+
+    /// Render a sound to a buffer, here on the application thread (e.g. to use
+    /// it as an impulse response). Stops after `max_seconds`, fading out.
+    fn render(&self, sound: &Sound, max_seconds: f64) -> Vec<crate::nodes::Frame> {
+        let max = (max_seconds * self.sample_rate as f64) as usize;
+        let mut node = sound.instantiate(self.sample_rate);
+        let mut frames = vec![[0.0; 2]; max];
+        let n = node.process(&mut frames);
+        frames.truncate(n);
+        if n == max {
+            let fade = (self.sample_rate as usize / 100).min(n);
+            for (i, f) in frames[n - fade..].iter_mut().enumerate() {
+                let gain = 1.0 - i as f32 / fade as f32;
+                f[0] *= gain;
+                f[1] *= gain;
+            }
+        }
+        frames
     }
 
     fn load(
@@ -418,6 +496,42 @@ mod tests {
         assert_eq!(
             error(r#"sample("kick.mp3", 0:00:500, 0:00:100)"#),
             "sample: expected an end after the start, got a duration"
+        );
+    }
+
+    #[test]
+    fn repeat_inf_keeps_going() {
+        let mut commands = evaluator()
+            .run(&parse(r#"sample("kick.mp3").fit(10ms).repeat(inf).play"#).unwrap())
+            .unwrap();
+        let Some(Command::Play(mut node)) = commands.pop() else {
+            panic!()
+        };
+        // Ten minutes' worth of 10ms kicks, in big blocks: still going.
+        let mut buf = vec![[0.0; 2]; 48_000];
+        for _ in 0..600 {
+            assert_eq!(node.process(&mut buf), buf.len());
+        }
+        assert_eq!(
+            error(r#"sample("kick.mp3").repeat(1.5)"#),
+            "repeat: expected a whole number or inf, got a number"
+        );
+    }
+
+    #[test]
+    fn reverb_presets_and_custom_spaces() {
+        let dry = render(r#"sample("kick.mp3").play"#);
+        let hall = render(r#"sample("kick.mp3").reverb("hall").play"#);
+        assert!(hall.len() > dry.len() + 48_000, "the hall rings on");
+        let custom = render(r#"sample("kick.mp3").reverb(sample("kick.mp3").fit(100ms), 1).play"#);
+        assert!(custom.len() > dry.len() && custom.len() < dry.len() + 48_000);
+        assert!(
+            error(r#"sample("kick.mp3").reverb("nowhere")"#)
+                .starts_with("reverb: unknown space \"nowhere\" (try small_room, ")
+        );
+        assert_eq!(
+            error(r#"sample("kick.mp3").reverb("hall", 2)"#),
+            "reverb: expected a mix between 0 and 1, got a number"
         );
     }
 

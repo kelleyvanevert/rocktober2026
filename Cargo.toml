@@ -8,3 +8,12 @@ edition = "2024"
 
 [workspace.dependencies]
 rocktober-engine = { path = "crates/engine" }
+
+# Audio code must keep up in real time even in debug builds (a debug-built FFT
+# reverb needs several CPU cores), so optimize the engine and all dependencies.
+# The app crate stays unoptimized, for fast rebuilds while working on the UI.
+[profile.dev.package.rocktober-engine]
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 3
