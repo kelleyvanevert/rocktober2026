@@ -1,0 +1,9 @@
+-- cmd-enter       run the selection, or the block under the cursor
+-- cmd-shift-enter run everything
+-- cmd-.           stop all sound
+
+play(sample("kick.mp3"))
+
+play(fit(sample("kick.mp3"), 500ms))
+
+play(repeat(fit(sample("kick.mp3"), 500ms), 4))

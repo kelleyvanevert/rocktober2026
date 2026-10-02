@@ -1,0 +1,9 @@
+[package]
+name = "rocktober-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cpal = "0.18.2"
+rtrb = "0.4.0"
+symphonia = { version = "0.6.1", features = ["mp3"] }

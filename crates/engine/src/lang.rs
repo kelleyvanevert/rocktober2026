@@ -1,6 +1,8 @@
 //! A tiny language: nested function calls over strings, numbers and durations.
 //!
-//!     play(repeat(fit(sample("kick.mp3"), 500ms), 4))   -- comment
+//! ```text
+//! play(repeat(fit(sample("kick.mp3"), 500ms), 4))   -- comment
+//! ```
 //!
 //! The parser knows nothing about what `play` or `fit` mean; it just builds a tree.
 //! Giving the tree meaning is `eval`'s job.

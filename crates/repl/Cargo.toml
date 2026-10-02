@@ -1,0 +1,7 @@
+[package]
+name = "rocktober-repl"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rocktober-engine.workspace = true

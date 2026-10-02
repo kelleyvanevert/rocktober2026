@@ -1,0 +1,17 @@
+[package]
+name = "rocktober"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gpui-kit = "0.7.0"
+rocktober-engine.workspace = true
+
+[dev-dependencies]
+gpui-kit = { version = "0.7.0", features = ["test-support"] }
+
+# GPUI's headless Metal renderer must run on the main thread, so this test has
+# its own `main` instead of the default test harness.
+[[test]]
+name = "ui"
+harness = false
