@@ -1,0 +1,27 @@
+
+
+ARCHITECTURE
+
+ app thread                                         audio thread (cpal callback)
+ ───────────                                        ──────────────────────────────
+ text ─▶ parse ─▶ eval ─▶ Sound (description)
+                           │ play(): instantiate
+                           ▼
+                   Box<dyn Node> ── commands queue ─▶ Engine: pop commands,
+                   (built, allocated, samples         mix active voices,
+                    already decoded)                   remove finished ones
+                                                          │
+            drop it here ◀── garbage queue ───────────────┘
+
+
+    - audio thread should never block (no files, allocations, mutexes, printing)
+    - `rtrb` = lock-free queue (like SC OSC messages)
+        - audio nodes are sent back via queue to main thread for deallocation
+
+        - (commands, commands_rx)
+        - (garbage_tx, garbage)
+
+    - nodes are pull-based
+        - Sampler
+        - Fit
+        - Repeat
