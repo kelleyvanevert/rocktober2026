@@ -76,6 +76,18 @@ fn starts_number(bytes: &[u8], i: usize) -> bool {
         && !(bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'-'))
 }
 
+/// A time position: `m:ss` (seconds may have decimals) or `m:ss:mmm`, e.g.
+/// `0:11:188` is 11.188 seconds.
+fn parse_time(text: &str) -> Option<f64> {
+    let parts: Vec<&str> = text.split(':').collect();
+    let int = |p: &str| p.parse::<u64>().ok().map(|v| v as f64);
+    match parts.as_slice() {
+        [m, s] => Some(int(m)? * 60.0 + s.parse::<f64>().ok().filter(|s| *s >= 0.0)?),
+        [m, s, ms] => Some(int(m)? * 60.0 + int(s)? + int(ms)? / 1000.0),
+        _ => None,
+    }
+}
+
 fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
     let bytes = src.as_bytes();
     let mut tokens = Vec::new();
@@ -121,6 +133,19 @@ fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                     && (bytes[i].is_ascii_digit() || (bytes[i] == b'.' && starts_number(bytes, i)))
                 {
                     i += 1;
+                }
+                if bytes.get(i) == Some(&b':') && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                    while i < bytes.len()
+                        && (bytes[i].is_ascii_digit() || matches!(bytes[i], b':' | b'.'))
+                    {
+                        i += 1;
+                    }
+                    let seconds = parse_time(&src[start..i]).ok_or_else(|| Error {
+                        pos: start,
+                        msg: format!("bad time '{}' (use m:ss or m:ss:mmm)", &src[start..i]),
+                    })?;
+                    tokens.push((Token::Duration(seconds), start));
+                    continue;
                 }
                 let value: f64 = match src[start..i].parse() {
                     Ok(v) => v,
@@ -333,6 +358,23 @@ mod tests {
         let prog = parse("a().fit").unwrap();
         assert_eq!(prog[0].pos, 4);
         assert_eq!(parse("a().(").unwrap_err().pos, 4);
+    }
+
+    #[test]
+    fn lexes_times() {
+        let times: Vec<f64> = ["0:11:188", "1:02", "0:30.5", "10:00:005"]
+            .iter()
+            .map(|t| match parse(&format!("f({t})")).unwrap()[0].expr {
+                Expr::Call { ref args, .. } => match args[0].expr {
+                    Expr::Duration(d) => (d * 1e6).round() / 1e6,
+                    _ => panic!(),
+                },
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(times, [11.188, 62.0, 30.5, 600.005]);
+        assert!(parse("f(1:2:3:4)").is_err());
+        assert!(parse("f(-1:00)").is_err());
     }
 
     #[test]

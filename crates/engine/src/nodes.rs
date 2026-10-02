@@ -23,6 +23,24 @@ pub trait Node: Send {
 
     /// Rewind to the beginning so the node can play again (used by `Repeat`).
     fn reset(&mut self);
+
+    /// Advance by up to `frames` without producing output, returning how many
+    /// frames were skipped (fewer means the node finished). The default renders
+    /// into a throwaway stack buffer; nodes that can jump directly override it,
+    /// so slicing deep into a long sample costs nothing.
+    fn skip(&mut self, frames: usize) -> usize {
+        let mut buf = [[0.0; 2]; 256];
+        let mut skipped = 0;
+        while skipped < frames {
+            let len = (frames - skipped).min(buf.len());
+            let n = self.process(&mut buf[..len]);
+            skipped += n;
+            if n < len {
+                break;
+            }
+        }
+        skipped
+    }
 }
 
 /// Plays a sample once, resampling on the fly (linear interpolation) if the file's
@@ -65,6 +83,15 @@ impl Node for Sampler {
 
     fn reset(&mut self) {
         self.pos = 0.0;
+    }
+
+    fn skip(&mut self, frames: usize) -> usize {
+        let remaining = ((self.data.frames.len() as f64 - self.pos) / self.step)
+            .ceil()
+            .max(0.0) as usize;
+        let n = frames.min(remaining);
+        self.pos += n as f64 * self.step;
+        n
     }
 }
 
@@ -126,6 +153,76 @@ impl Node for Fit {
         self.child.reset();
         self.child_done = false;
         self.pos = 0;
+    }
+
+    fn skip(&mut self, frames: usize) -> usize {
+        let n = frames.min(self.len - self.pos);
+        if !self.child_done && self.child.skip(n) < n {
+            self.child_done = true;
+        }
+        self.pos += n;
+        n
+    }
+}
+
+/// A window `start..start + len` of its child, with short fades at both edges.
+/// Unlike `Fit` it doesn't pad: if the child ends inside the window, so does
+/// the slice.
+pub struct Slice {
+    child: Box<dyn Node>,
+    start: usize,
+    len: usize,
+    fade: usize,
+    pos: usize,
+}
+
+impl Slice {
+    /// Skips to `start` right away, so on the application thread when the node is
+    /// built there.
+    pub fn new(mut child: Box<dyn Node>, start: usize, len: usize, fade: usize) -> Self {
+        child.skip(start);
+        Self {
+            child,
+            start,
+            len,
+            fade: fade.min(len / 2),
+            pos: 0,
+        }
+    }
+}
+
+impl Node for Slice {
+    fn process(&mut self, out: &mut [Frame]) -> usize {
+        let n = out.len().min(self.len - self.pos);
+        let written = self.child.process(&mut out[..n]);
+        if self.fade > 0 {
+            for (i, frame) in out[..written].iter_mut().enumerate() {
+                let p = self.pos + i;
+                let gain = if p < self.fade {
+                    (p + 1) as f32 / self.fade as f32
+                } else if p >= self.len - self.fade {
+                    (self.len - p) as f32 / self.fade as f32
+                } else {
+                    continue;
+                };
+                frame[0] *= gain;
+                frame[1] *= gain;
+            }
+        }
+        self.pos += written;
+        written
+    }
+
+    fn reset(&mut self) {
+        self.child.reset();
+        self.child.skip(self.start);
+        self.pos = 0;
+    }
+
+    fn skip(&mut self, frames: usize) -> usize {
+        let n = self.child.skip(frames.min(self.len - self.pos));
+        self.pos += n;
+        n
     }
 }
 
@@ -236,6 +333,18 @@ impl Node for Add {
         self.children.iter_mut().for_each(|c| c.reset());
         self.done.fill(false);
     }
+
+    fn skip(&mut self, frames: usize) -> usize {
+        let mut longest = 0;
+        for (child, done) in self.children.iter_mut().zip(&mut self.done) {
+            if !*done {
+                let n = child.skip(frames);
+                *done = n < frames;
+                longest = longest.max(n);
+            }
+        }
+        longest
+    }
 }
 
 /// Plays its children one after another, sample-accurately.
@@ -295,6 +404,10 @@ impl Node for Gain {
 
     fn reset(&mut self) {
         self.child.reset();
+    }
+
+    fn skip(&mut self, frames: usize) -> usize {
+        self.child.skip(frames)
     }
 }
 
@@ -537,6 +650,50 @@ mod tests {
             seq.reset();
         }
         assert!(render(&mut Seq::new(vec![])).is_empty());
+    }
+
+    fn ramp(n: usize) -> Box<dyn Node> {
+        let frames = (0..n).map(|i| [i as f32, i as f32]).collect();
+        Box::new(Sampler::new(
+            Arc::new(SampleData {
+                frames,
+                sample_rate: 48_000,
+            }),
+            48_000,
+        ))
+    }
+
+    #[test]
+    fn slice_takes_a_window() {
+        let mut slice = Slice::new(ramp(100), 10, 5, 0);
+        for _ in 0..2 {
+            let left: Vec<f32> = render(&mut slice).iter().map(|f| f[0]).collect();
+            assert_eq!(left, [10., 11., 12., 13., 14.]);
+            slice.reset();
+        }
+        // Past the end of the child, the slice just ends early.
+        assert_eq!(render(&mut Slice::new(ramp(100), 98, 10, 0)).len(), 2);
+        assert!(render(&mut Slice::new(ramp(100), 200, 10, 0)).is_empty());
+    }
+
+    #[test]
+    fn slice_fades_both_edges() {
+        let left: Vec<f32> = render(&mut Slice::new(ones(100), 0, 8, 4))
+            .iter()
+            .map(|f| f[0])
+            .collect();
+        assert_eq!(left, [0.25, 0.5, 0.75, 1.0, 1.0, 0.75, 0.5, 0.25]);
+    }
+
+    #[test]
+    fn default_skip_matches_rendering() {
+        // Seq doesn't override skip, so this exercises the default.
+        let mut a = Seq::new(vec![ramp(300), ramp(300)]);
+        assert_eq!(a.skip(450), 450);
+        let mut buf = [[0.0; 2]; 1];
+        a.process(&mut buf);
+        assert_eq!(buf[0][0], 150.0);
+        assert_eq!(a.skip(10_000), 149);
     }
 
     #[test]

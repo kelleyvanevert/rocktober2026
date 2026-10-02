@@ -6,15 +6,32 @@ use std::path::Path;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, TrackType};
+use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
+use symphonia::core::units::Time;
 
 use crate::nodes::{Frame, SampleData};
+
+/// Fade applied where a window cuts into the audio, so the cut doesn't click.
+const EDGE_FADE_SECONDS: f64 = 0.003;
+
+/// How far before `start` to seek. Decoders need a few frames to warm up after a
+/// seek (MP3 borrows bits from earlier frames, AAC overlaps them), and their
+/// first output is silence or garbage; we decode and drop this much first.
+const SEEK_PREROLL_SECONDS: f64 = 0.5;
 
 /// Decode a whole file to stereo f32 frames. Mono is duplicated to both sides;
 /// beyond two channels, only the first two are kept.
 pub fn load(path: &Path) -> Result<SampleData, String> {
+    load_range(path, 0.0, None)
+}
+
+/// Decode only `start..end` seconds of a file (`end: None` means to the end of
+/// the file). The decoder seeks to `start` instead of decoding everything before
+/// it, so a short window of a long recording is fast and small. Edges that cut
+/// into the audio get a short fade.
+pub fn load_range(path: &Path, start: f64, end: Option<f64>) -> Result<SampleData, String> {
     let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
 
     let file = File::open(path).map_err(|e| fail(&e))?;
@@ -36,22 +53,52 @@ pub fn load(path: &Path) -> Result<SampleData, String> {
         .default_track(TrackType::Audio)
         .ok_or_else(|| fail(&"no audio track"))?;
     let track_id = track.id;
+    let time_base = track.time_base;
     let params = track
         .codec_params
         .as_ref()
         .and_then(|p| p.audio())
         .ok_or_else(|| fail(&"no audio codec parameters"))?;
+    let mut sample_rate = params.sample_rate.unwrap_or(0);
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(params, &AudioDecoderOptions::default())
         .map_err(|e| fail(&e))?;
 
+    // Seeking needs packet timestamps to know where we landed. If the file can't
+    // seek, we decode from the beginning and drop what comes before `start`.
+    let seek_to = start - SEEK_PREROLL_SECONDS;
+    if seek_to > 0.0
+        && time_base.is_some()
+        && let Some(time) = Time::try_from_secs_f64(seek_to)
+    {
+        let to = SeekTo::Time {
+            time,
+            track_id: Some(track_id),
+        };
+        if format.seek(SeekMode::Accurate, to).is_ok() {
+            decoder.reset();
+        }
+    }
+
     let mut frames: Vec<Frame> = Vec::new();
-    let mut sample_rate = 0;
     let mut interleaved: Vec<f32> = Vec::new();
+    // Time (in seconds) of the next decoded packet's first frame.
+    let mut t = 0.0;
+    // Whether we stopped because of `end`, rather than the file ending.
+    let mut cut_end = false;
 
     while let Some(packet) = format.next_packet().map_err(|e| fail(&e))? {
         if packet.track_id != track_id {
             continue;
+        }
+        // `pts` includes the encoder-delay frames the decoder trims off the start.
+        if let Some(tb) = time_base {
+            let ticks = packet.pts.get() + packet.trim_start.get() as i64;
+            t = ticks as f64 * tb.numer.get() as f64 / tb.denom.get() as f64;
+        }
+        if end.is_some_and(|end| t >= end) {
+            cut_end = true;
+            break;
         }
         let buf = match decoder.decode(&packet) {
             Ok(buf) => buf,
@@ -62,16 +109,55 @@ pub fn load(path: &Path) -> Result<SampleData, String> {
         let channels = buf.spec().channels().count().max(1);
         interleaved.resize(buf.samples_interleaved(), 0.0);
         buf.copy_to_slice_interleaved(&mut interleaved);
-        frames.extend(interleaved.chunks_exact(channels).map(|f| match f {
-            [mono] => [*mono, *mono],
-            [l, r, ..] => [*l, *r],
-            [] => unreachable!(),
-        }));
+
+        let rate = sample_rate as f64;
+        let decoded = interleaved.len() / channels;
+        // Which of this packet's frames fall inside the window.
+        let first = ((start - t) * rate).round().clamp(0.0, decoded as f64) as usize;
+        let last = match end {
+            Some(end) => ((end - t) * rate).round().clamp(0.0, decoded as f64) as usize,
+            None => decoded,
+        };
+        cut_end |= last < decoded;
+        if first < last {
+            frames.extend(
+                interleaved[first * channels..last * channels]
+                    .chunks_exact(channels)
+                    .map(|f| match f {
+                        [mono] => [*mono, *mono],
+                        [l, r, ..] => [*l, *r],
+                        [] => unreachable!(),
+                    }),
+            );
+        }
+        t += decoded as f64 / rate;
     }
 
-    if sample_rate == 0 {
-        return Err(fail(&"file contains no audio"));
+    if frames.is_empty() {
+        return Err(match (start, end) {
+            (0.0, None) => fail(&"file contains no audio"),
+            _ => fail(&"no audio in that range (is the file shorter?)"),
+        });
     }
+
+    let fade = ((EDGE_FADE_SECONDS * sample_rate as f64) as usize).min(frames.len() / 2);
+    if start > 0.0 {
+        for (i, frame) in frames[..fade].iter_mut().enumerate() {
+            let gain = (i + 1) as f32 / fade as f32;
+            frame[0] *= gain;
+            frame[1] *= gain;
+        }
+    }
+    // Only fade the end if it cut the audio off (i.e. we stopped before the file did).
+    if cut_end {
+        let len = frames.len();
+        for (i, frame) in frames[len - fade..].iter_mut().enumerate() {
+            let gain = (fade - i) as f32 / fade as f32;
+            frame[0] *= gain;
+            frame[1] *= gain;
+        }
+    }
+
     Ok(SampleData {
         frames,
         sample_rate,

@@ -13,3 +13,5 @@ add(
   sample("kick.mp3").gain(-12db).fit(500ms).repeat(4),
   sample("kick.mp3").gain(-6db).fit(500ms).repeat(4),
 ).limit.play
+
+sample("recordings/2026-08-29 Big dinner.m4a", 0:11:188, 0:12:625).play

@@ -6,12 +6,12 @@
 //! once, each play getting its own fresh playback state.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::engine::Command;
 use crate::lang::{Error, Expr, Spanned};
-use crate::nodes::{Add, Fit, Gain, Limit, Node, Repeat, SampleData, Sampler, Seq};
+use crate::nodes::{Add, Fit, Gain, Limit, Node, Repeat, SampleData, Sampler, Seq, Slice};
 use crate::sample;
 
 /// Fade-out applied where `fit` cuts a sound off. A few ms is enough to remove the
@@ -28,6 +28,8 @@ const LIMIT_RELEASE_SECONDS: f64 = 0.1;
 pub enum Sound {
     Sample(Arc<SampleData>),
     Fit(Box<Sound>, f64),
+    /// Start and end, in seconds.
+    Slice(Box<Sound>, f64, f64),
     Repeat(Box<Sound>, usize),
     Add(Vec<Sound>),
     Seq(Vec<Sound>),
@@ -43,6 +45,12 @@ impl Sound {
             Sound::Fit(child, seconds) => Box::new(Fit::new(
                 child.instantiate(sample_rate),
                 frames(*seconds),
+                frames(FIT_FADE_SECONDS),
+            )),
+            Sound::Slice(child, start, end) => Box::new(Slice::new(
+                child.instantiate(sample_rate),
+                frames(*start),
+                frames(*end) - frames(*start),
                 frames(FIT_FADE_SECONDS),
             )),
             Sound::Repeat(child, times) => {
@@ -93,13 +101,17 @@ impl Value {
     }
 }
 
+/// A decoded part of a file, as (start, end) seconds in `f64::to_bits` form so it
+/// can be a map key.
+type Window = (u64, Option<u64>);
+
 pub struct Evaluator {
     sample_rate: u32,
     sample_dirs: Vec<PathBuf>,
     /// Decoded samples, so each file is only loaded once. Holding an `Arc` here
     /// also guarantees the last reference to a sample is never dropped on the
     /// audio thread.
-    cache: HashMap<PathBuf, Arc<SampleData>>,
+    cache: HashMap<(PathBuf, Window), Arc<SampleData>>,
 }
 
 impl Evaluator {
@@ -137,8 +149,10 @@ impl Evaluator {
 
         let (min_args, max_args) = match name {
             "stop" => (0, 0),
-            "sample" | "play" => (1, 1),
+            "play" => (1, 1),
+            "sample" => (1, 3),
             "fit" | "repeat" | "gain" => (2, 2),
+            "slice" => (3, 3),
             "limit" => (1, 2),
             "add" | "seq" => (0, usize::MAX),
             _ => return fail(format!("unknown function '{name}'")),
@@ -163,17 +177,51 @@ impl Evaluator {
         let sound = |s: Sound| Ok(Value::Sound(s));
 
         match (name, values.as_slice()) {
-            ("sample", [Value::Str(path)]) => match self.load(path) {
-                Ok(data) => sound(Sound::Sample(data)),
-                Err(msg) => fail(msg),
-            },
-            ("sample", [v]) => wrong(v, "a file name", 0),
+            ("sample", [Value::Str(path), rest @ ..]) => {
+                let start = match rest.first() {
+                    None => 0.0,
+                    Some(Value::Duration(d)) => *d,
+                    Some(v) => return wrong(v, "a start time (like 0:11:188)", 1),
+                };
+                let end = match rest.get(1) {
+                    None => None,
+                    Some(Value::Duration(d)) if *d > start => Some(*d),
+                    Some(Value::Duration(_)) => {
+                        return wrong(&rest[1], "an end after the start", 2);
+                    }
+                    Some(v) => return wrong(v, "an end time (like 0:12:625)", 2),
+                };
+                match self.load(path, start, end) {
+                    Ok(data) => sound(Sound::Sample(data)),
+                    Err(msg) => fail(msg),
+                }
+            }
+            ("sample", [v, ..]) => wrong(v, "a file name", 0),
 
             ("fit", [Value::Sound(s), Value::Duration(d)]) => {
                 sound(Sound::Fit(Box::new(s.clone()), *d))
             }
             ("fit", [Value::Sound(_), v]) => wrong(v, "a duration (like 500ms)", 1),
             ("fit", [v, _]) => wrong(v, "a sound", 0),
+
+            (
+                "slice",
+                [
+                    Value::Sound(s),
+                    Value::Duration(start),
+                    Value::Duration(end),
+                ],
+            ) => {
+                if end <= start {
+                    return wrong(&values[2], "an end after the start", 2);
+                }
+                sound(Sound::Slice(Box::new(s.clone()), *start, *end))
+            }
+            ("slice", [Value::Sound(_), Value::Duration(_), v]) => {
+                wrong(v, "an end time (like 0:12:625)", 2)
+            }
+            ("slice", [Value::Sound(_), v, _]) => wrong(v, "a start time (like 0:11:188)", 1),
+            ("slice", [v, ..]) => wrong(v, "a sound", 0),
 
             ("repeat", [Value::Sound(s), Value::Num(n)]) if *n >= 0.0 && n.fract() == 0.0 => {
                 sound(Sound::Repeat(Box::new(s.clone()), *n as usize))
@@ -222,18 +270,24 @@ impl Evaluator {
         }
     }
 
-    fn load(&mut self, name: &str) -> Result<Arc<SampleData>, String> {
+    fn load(
+        &mut self,
+        name: &str,
+        start: f64,
+        end: Option<f64>,
+    ) -> Result<Arc<SampleData>, String> {
         let path = self
             .sample_dirs
             .iter()
             .map(|dir| dir.join(name))
             .find(|p| p.is_file())
             .ok_or_else(|| format!("sample '{name}' not found in {:?}", self.sample_dirs))?;
-        if let Some(data) = self.cache.get(&path) {
+        let key = (path, (start.to_bits(), end.map(f64::to_bits)));
+        if let Some(data) = self.cache.get(&key) {
             return Ok(data.clone());
         }
-        let data = Arc::new(sample::load(Path::new(&path))?);
-        self.cache.insert(path, data.clone());
+        let data = Arc::new(sample::load_range(&key.0, start, end)?);
+        self.cache.insert(key, data.clone());
         Ok(data)
     }
 }
@@ -245,7 +299,7 @@ mod tests {
     use crate::nodes::Frame;
 
     fn evaluator() -> Evaluator {
-        let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples");
+        let samples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples");
         Evaluator::new(48_000, vec![samples])
     }
 
@@ -322,6 +376,49 @@ mod tests {
         let frames =
             render(r#"seq(sample("kick.mp3").fit(100ms), sample("kick.mp3").fit(250ms),).play"#);
         assert_eq!(frames.len(), 4_800 + 12_000);
+    }
+
+    #[test]
+    fn slice_cuts_a_window_out_of_a_sample() {
+        let whole = render(r#"sample("kick.mp3").play"#);
+        let slice = render(r#"sample("kick.mp3").slice(0:00:100, 0:00:300).play"#);
+        assert_eq!(slice.len(), 9_600);
+        // Away from the fades, it's exactly the original (resampled the same way).
+        let diff = slice[200..9_400]
+            .iter()
+            .zip(&whole[4_800 + 200..])
+            .map(|(a, b)| (a[0] - b[0]).abs())
+            .fold(0f32, f32::max);
+        assert!(diff < 1e-6, "max diff {diff}");
+        assert_eq!(
+            error(r#"sample("kick.mp3").slice(0:01, 0:00:500)"#),
+            "slice: expected an end after the start, got a duration"
+        );
+    }
+
+    #[test]
+    fn sample_can_decode_just_a_window() {
+        let whole = render(r#"sample("kick.mp3").play"#);
+        let window = render(r#"sample("kick.mp3", 0:00:100, 0:00:300).play"#);
+        assert!((9_600..=9_601).contains(&window.len()), "{}", window.len());
+        // Same audio as slicing the whole file, away from the edge fades.
+        for (a, b) in window[400..9_200].iter().zip(&whole[4_800 + 400..]) {
+            assert!((a[0] - b[0]).abs() < 1e-6, "{a:?} vs {b:?}");
+        }
+        // Start only: runs to the end of the file.
+        let tail = render(r#"sample("kick.mp3", 0:00:500).play"#);
+        assert!(tail.len().abs_diff(whole.len() - 24_000) <= 1);
+        assert_eq!(
+            error(r#"sample("kick.mp3", 0:10)"#)
+                .split(": ")
+                .last()
+                .unwrap(),
+            "no audio in that range (is the file shorter?)"
+        );
+        assert_eq!(
+            error(r#"sample("kick.mp3", 0:00:500, 0:00:100)"#),
+            "sample: expected an end after the start, got a duration"
+        );
     }
 
     #[test]
