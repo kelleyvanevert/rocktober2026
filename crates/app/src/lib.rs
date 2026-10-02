@@ -5,7 +5,10 @@ pub mod workspace;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 
-actions!(rocktober, [RunBlock, RunAll, StopAll, Save, Quit]);
+actions!(
+    rocktober,
+    [RunBlock, RunAll, StopAll, Save, ToggleRecording, Quit]
+);
 
 /// App-wide setup: theme and key bindings. Call after `gpui_kit::init`.
 pub fn init(cx: &mut App) {
@@ -19,6 +22,7 @@ pub fn init(cx: &mut App) {
             KeyBinding::new("cmd-shift-enter", RunAll, context),
             KeyBinding::new("cmd-.", StopAll, context),
             KeyBinding::new("cmd-s", Save, context),
+            KeyBinding::new("cmd-r", ToggleRecording, context),
         ]);
     }
     cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);

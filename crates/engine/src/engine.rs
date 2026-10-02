@@ -16,6 +16,9 @@ const MAX_VOICES: usize = 256;
 pub enum Command {
     Play(Box<dyn Node>),
     StopAll,
+    /// Copy the output (interleaved stereo) into this queue until told to stop.
+    StartRecording(Producer<f32>),
+    StopRecording,
 }
 
 /// Feedback from the audio thread, readable from anywhere.
@@ -23,6 +26,8 @@ pub enum Command {
 pub struct Status {
     pub voices: AtomicUsize,
     pub commands_received: AtomicU64,
+    /// Samples the recorder couldn't keep up with (should stay 0).
+    pub recording_dropped: AtomicU64,
 }
 
 struct Voice {
@@ -40,6 +45,7 @@ pub struct Engine {
     voices: Vec<Voice>,
     scratch: Vec<Frame>,
     stop_fade: usize,
+    recorder: Option<Producer<f32>>,
 }
 
 impl Engine {
@@ -57,6 +63,7 @@ impl Engine {
             voices: Vec::with_capacity(MAX_VOICES),
             scratch: vec![[0.0; 2]; MAX_BLOCK],
             stop_fade: (sample_rate as usize / 100).max(1), // 10 ms
+            recorder: None,
         }
     }
 
@@ -81,6 +88,9 @@ impl Engine {
                         v.stopping.get_or_insert(self.stop_fade);
                     }
                 }
+                Command::StartRecording(producer) => self.recorder = Some(producer),
+                // Dropping our end tells the writer thread to finish the file.
+                Command::StopRecording => self.recorder = None,
             }
         }
 
@@ -112,6 +122,29 @@ impl Engine {
                 self.retire(voice.node);
             } else {
                 i += 1;
+            }
+        }
+
+        // Clip here rather than in the device callback, so recordings get
+        // exactly what's heard.
+        for frame in out.iter_mut() {
+            frame[0] = frame[0].clamp(-1.0, 1.0);
+            frame[1] = frame[1].clamp(-1.0, 1.0);
+        }
+        if let Some(recorder) = &mut self.recorder {
+            let mut dropped = 0;
+            for &[l, r] in out.iter() {
+                if recorder.slots() < 2 {
+                    dropped += 2;
+                    continue;
+                }
+                let _ = recorder.push(l);
+                let _ = recorder.push(r);
+            }
+            if dropped > 0 {
+                self.status
+                    .recording_dropped
+                    .fetch_add(dropped, Ordering::Relaxed);
             }
         }
 

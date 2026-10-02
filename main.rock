@@ -1,40 +1,60 @@
--- cmd-enter       run the selection, or the block under the cursor
--- cmd-shift-enter run everything
--- cmd-.           stop all sound
+-- cmd-enter        run the selection, or the block under the cursor
+-- cmd-shift-enter  run everything
+-- cmd-.            stop all sound
+-- cmd-r            start/stop recording
+-- cmd-s            save file
 
-sample("kick.mp3").fit(500ms).repeat(inf).play
-
-sample("kick.mp3").delay(12s).play
-
-seq(
-  sample("kick.mp3").fit(250ms),
-  sample("kick.mp3").fit(125ms).repeat(2),
-).repeat(2).play
+sample("kick.mp3").play
 
 add(
   sample("kick.mp3").gain(-12db).fit(500ms).repeat(inf),
   sample("kick.mp3").gain(-6db).fit(200ms).repeat(inf),
 )
-  .reverb(sample("kick.mp3")).limit.play
+  .reverb(sample("kick.mp3")).gain(.3).limit.play
 
-sample("recordings/2026-08-29 Big dinner.m4a", 0:11:188, 0:12:625)
-  .play
 
-sample("recordings/2026-08-31 Airplane.m4a", 0:28, 0:32).play
-
-add(
-  sample("recordings/2026-09-25 Gong sound 2.m4a", 0:08:672).fit(150ms).repeat(inf).reverb("cathedral"),
-  sample("recordings/2026-08-31 Airplane bark.m4a", 0:8, 0:9).fit(650ms).repeat(inf)
-).play
+sample("recordings/2026-09-25 Gong sound 2.m4a", 0:08:672).gain(-6db).reverb("cathedral").play
 
 
 
 
+-- silje sings
 sample("recordings/2026-10-02 Silje 3.m4a", 0:06:500, 0:16:500).reverb("cathedral").play
 
-sample("recordings/2026-09-25 Gong sound 2.m4a", 0:08:672).fit(150ms).gain(-12db).repeat(inf).reverb("cathedral").play
-sample("recordings/2026-08-31 Airplane bark.m4a", 0:8, 0:9).repeat(inf).play
+-- dramatic percussion
+sample("recordings/2026-09-25 Gong sound 2.m4a", 0:08:672).fit(150ms).gain(-15db).repeat(inf).reverb("cathedral").play
+sample("recordings/2026-08-31 Airplane bark.m4a", 0:8, 0:9).gain(-6db).repeat(inf).play
 
-sample("recordings/2026-10-02 Silje 2.m4a", 0:59, 1:01).reverb("cathedral").play
+-- spanish speaking train conductor
+sample("recordings/2026-07-23 Spanish speaking train conductor 2.m4a").gain(-6db).play
 
+-- oh i can't do it
+sample("recordings/2026-10-02 Silje 2.m4a", 0:59, 1:01).reverb("dark_room").play
+
+-- does the sibling die?
 sample("recordings/2026-10-02 Silje 2.m4a", 1:10:688, 1:15:500).reverb("dark_room").play
+
+-- kicks
+sample("kick.mp3").fit(500ms).repeat(inf).play
+
+-- xiao dong
+sample("recordings/2026-08-29 Big dinner.m4a", 0:11:190, 0:12:500).play
+
+-- ..
+seq(
+  sample("recordings/2026-07-23 Spanish speaking train conductor 2.m4a", 0:05:250, 0:06:125).gain(-6db),
+  sample("recordings/2026-05-19 Noa, Carlota.m4a", 1:27:938, 1:30).gain(1.7),
+  sample("recordings/2026-08-29 Big dinner.m4a", 0:11:190, 0:12:500)
+).reverb("bright_room").play
+
+-- noa
+sample("recordings/2026-05-19 Noa, Carlota.m4a", 1:27:938, 1:30).gain(1.7).play
+
+-- noa, jha!
+sample("recordings/2026-05-19 Noa, Carlota.m4a", 3:57:125, 3:60:200).gain(-2db).play
+
+-- noa + kelley speaking danish
+sample("recordings/2026-05-19 Noa, Carlota.m4a", 2:14, 2:22:250).play
+
+-- kelley speaking flemish
+sample("recordings/2026-05-19 Noa, Carlota.m4a", 6:43:500, 6:46:950).play

@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 cpal = "0.18.2"
+hound = "3.5.1"
 realfft = "3.5.0"
 rtrb = "0.4.0"
 symphonia = { version = "0.6.1", features = ["mp3", "aac", "alac", "isomp4", "aiff"] }

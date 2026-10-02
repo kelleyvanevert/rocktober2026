@@ -1,7 +1,7 @@
 //! A running audio engine plus the evaluator that feeds it: the one object a
 //! frontend (REPL, editor app, ...) needs to hold on to.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -14,6 +14,7 @@ use crate::engine::{Command, Engine, MAX_BLOCK, Status};
 use crate::eval::Evaluator;
 use crate::lang;
 use crate::nodes::{Frame, Node};
+use crate::recorder::Recording;
 
 pub struct Session {
     pub device_name: String,
@@ -23,6 +24,7 @@ pub struct Session {
     status: Arc<Status>,
     evaluator: Evaluator,
     sent: u64,
+    recording: Option<Recording>,
     _output: Output,
 }
 
@@ -80,6 +82,7 @@ impl Session {
             status,
             evaluator: Evaluator::new(config.sample_rate, sample_dirs),
             sent: 0,
+            recording: None,
             _output: Output::Device(stream),
         })
     }
@@ -99,6 +102,7 @@ impl Session {
             status,
             evaluator: Evaluator::new(sample_rate, sample_dirs),
             sent: 0,
+            recording: None,
             _output: Output::None(engine),
         }
     }
@@ -131,11 +135,49 @@ impl Session {
         }
     }
 
+    /// Start writing everything that's played to a WAV file at `path`.
+    pub fn start_recording(&mut self, path: &Path) -> Result<(), String> {
+        if self.recording.is_some() {
+            return Err("already recording".into());
+        }
+        let (recording, producer) = Recording::start(path, self.sample_rate)?;
+        self.send(Command::StartRecording(producer));
+        self.recording = Some(recording);
+        Ok(())
+    }
+
+    /// Stop recording. The file is finished in the background, within a few
+    /// tens of milliseconds. Returns its path and how long the recording was.
+    pub fn stop_recording(&mut self) -> Option<(PathBuf, Duration)> {
+        let recording = self.recording.take()?;
+        self.send(Command::StopRecording);
+        Some((recording.path.clone(), recording.started.elapsed()))
+    }
+
+    /// How long the current recording has been running, if there is one.
+    pub fn recording_time(&self) -> Option<Duration> {
+        self.recording.as_ref().map(|r| r.started.elapsed())
+    }
+
     fn send(&mut self, cmd: Command) {
         // The queue only fills up if the audio thread has stalled; dropping the
         // command is better than blocking the UI.
         if self.commands.push(cmd).is_ok() {
             self.sent += 1;
+        }
+    }
+}
+
+impl Drop for Session {
+    /// Quitting while recording: stop, and give the writer a moment to finish
+    /// the file. (The audio stream is still running here, so the stop arrives.)
+    fn drop(&mut self) {
+        if let Some(recording) = self.recording.take() {
+            self.send(Command::StopRecording);
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while !recording.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 }
@@ -161,7 +203,6 @@ where
                 let mix = &mut mix[..frames];
                 engine.process(mix);
                 for (out, &[l, r]) in chunk.chunks_mut(channels).zip(mix.iter()) {
-                    let (l, r) = (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0));
                     match out {
                         [mono] => *mono = T::from_sample((l + r) * 0.5),
                         [left, right, rest @ ..] => {

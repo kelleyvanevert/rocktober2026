@@ -13,7 +13,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rocktober_engine::Session;
 
-use crate::{RunAll, RunBlock, Save, StopAll, blocks, comments};
+use crate::{RunAll, RunBlock, Save, StopAll, ToggleRecording, blocks, comments};
 
 const FLASH_DURATION: Duration = Duration::from_millis(250);
 const MAX_LOG_ENTRIES: usize = 500;
@@ -21,6 +21,7 @@ const MAX_LOG_ENTRIES: usize = 500;
 const EXAMPLE: &str = r#"-- cmd-enter       run the selection, or the block under the cursor
 -- cmd-shift-enter run everything
 -- cmd-.           stop all sound
+-- cmd-r           start/stop recording to recordings/
 
 sample("kick.mp3").play
 
@@ -62,6 +63,8 @@ pub struct Workspace {
     flash_generation: u64,
     session: Option<Session>,
     voices: usize,
+    /// Whole seconds recorded, as last shown (so the timer redraws once a second).
+    recorded_secs: Option<u64>,
     log: Vec<LogEntry>,
     log_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
@@ -156,8 +159,14 @@ impl Workspace {
                     .await;
                 let alive = this.update(cx, |this, cx| {
                     let voices = this.session.as_ref().map_or(0, |s| s.voices());
-                    if voices != this.voices {
+                    let recorded = this
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.recording_time())
+                        .map(|t| t.as_secs());
+                    if voices != this.voices || recorded != this.recorded_secs {
                         this.voices = voices;
+                        this.recorded_secs = recorded;
                         cx.notify();
                     }
                 });
@@ -178,6 +187,7 @@ impl Workspace {
             flash_generation: 0,
             session,
             voices: 0,
+            recorded_secs: None,
             log,
             log_scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -226,6 +236,42 @@ impl Workspace {
         if let Some(session) = &mut self.session {
             session.stop_all();
             self.push_log(LogKind::Info, "stop".into(), cx);
+        }
+    }
+
+    fn toggle_recording(&mut self, _: &ToggleRecording, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = &mut self.session else {
+            self.push_log(LogKind::Error, "no audio device".into(), cx);
+            return;
+        };
+        if let Some((path, length)) = session.stop_recording() {
+            let secs = length.as_secs();
+            self.recorded_secs = None;
+            self.push_log(
+                LogKind::Info,
+                format!("saved {} ({}:{:02})", path.display(), secs / 60, secs % 60),
+                cx,
+            );
+            return;
+        }
+        let dir = match self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            Some(dir) => dir.join("recordings"),
+            None => PathBuf::from("recordings"),
+        };
+        let name = chrono::Local::now()
+            .format("%Y-%m-%d %H.%M.%S.wav")
+            .to_string();
+        let path = dir.join(name);
+        match session.start_recording(&path) {
+            Ok(()) => {
+                self.recorded_secs = Some(0);
+                self.push_log(
+                    LogKind::Info,
+                    format!("recording to {}", path.display()),
+                    cx,
+                );
+            }
+            Err(e) => self.push_log(LogKind::Error, format!("can't record: {e}"), cx),
         }
     }
 
@@ -369,6 +415,23 @@ impl Workspace {
             .child(div().flex_1())
             .child(
                 div()
+                    .id("record")
+                    .cursor_pointer()
+                    .hover(|this| this.text_color(theme.foreground))
+                    .map(|this| match self.recorded_secs {
+                        Some(secs) => this.text_color(theme.danger).child(format!(
+                            "● {}:{:02}",
+                            secs / 60,
+                            secs % 60
+                        )),
+                        None => this.child("● rec"),
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_recording(&ToggleRecording, window, cx)
+                    })),
+            )
+            .child(
+                div()
                     .when(self.voices > 0, |this| this.text_color(theme.success))
                     .child(voices),
             )
@@ -413,6 +476,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::run_all))
             .on_action(cx.listener(Self::stop_all))
             .on_action(cx.listener(Self::save))
+            .on_action(cx.listener(Self::toggle_recording))
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
