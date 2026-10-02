@@ -4,6 +4,13 @@
 //! play(repeat(fit(sample("kick.mp3"), 500ms), 4))   -- comment
 //! ```
 //!
+//! `x.f(a, b)` is shorthand for `f(x, a, b)`, and `x.f` for `f(x)`, so the two
+//! styles can be mixed freely:
+//!
+//! ```text
+//! sample("kick.mp3").fit(500ms).repeat(4).play
+//! ```
+//!
 //! The parser knows nothing about what `play` or `fit` mean; it just builds a tree.
 //! Giving the tree meaning is `eval`'s job.
 
@@ -56,6 +63,17 @@ enum Token {
     LParen,
     RParen,
     Comma,
+    Dot,
+}
+
+/// Whether a '.' or '-' at `i` begins (or continues) a number rather than being
+/// punctuation.
+fn starts_number(bytes: &[u8], i: usize) -> bool {
+    matches!(bytes[i], b'.' | b'-')
+        && bytes
+            .get(i + 1)
+            .is_some_and(|b| b.is_ascii_digit() || *b == b'.')
+        && !(bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'-'))
 }
 
 fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
@@ -72,11 +90,12 @@ fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                     i += 1;
                 }
             }
-            b'(' | b')' | b',' => {
+            b'(' | b')' | b',' | b'.' if !starts_number(bytes, i) => {
                 let tok = match c {
                     b'(' => Token::LParen,
                     b')' => Token::RParen,
-                    _ => Token::Comma,
+                    b',' => Token::Comma,
+                    _ => Token::Dot,
                 };
                 tokens.push((tok, start));
                 i += 1;
@@ -92,8 +111,15 @@ fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                 tokens.push((Token::Str(src[start + 1..i].to_string()), start));
                 i += 1;
             }
-            b'0'..=b'9' | b'.' => {
-                while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            b'0'..=b'9' | b'.' | b'-' => {
+                if c == b'-' {
+                    i += 1;
+                }
+                // A '.' only continues a number if a digit follows, so `4.repeat`
+                // lexes as `4` `.` `repeat`.
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_digit() || (bytes[i] == b'.' && starts_number(bytes, i)))
+                {
                     i += 1;
                 }
                 let value: f64 = match src[start..i].parse() {
@@ -108,6 +134,8 @@ fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                     "" => Token::Num(value),
                     "ms" => Token::Duration(value / 1000.0),
                     "s" => Token::Duration(value),
+                    // Decibels are just a way to write an amplitude factor.
+                    "db" => Token::Num(10f64.powf(value / 20.0)),
                     unit => return err(unit_start, format!("unknown unit '{unit}'")),
                 };
                 tokens.push((tok, start));
@@ -151,7 +179,29 @@ impl Parser {
         }
     }
 
+    /// A primary expression followed by any number of `.method` calls.
     fn expr(&mut self) -> Result<Spanned, Error> {
+        let mut expr = self.primary()?;
+        while self.peek() == Some(&Token::Dot) {
+            self.i += 1;
+            let pos = self.pos();
+            let Some(Token::Ident(name)) = self.peek().cloned() else {
+                return err(pos, "expected a name after '.'");
+            };
+            self.i += 1;
+            let mut args = vec![expr];
+            if self.peek() == Some(&Token::LParen) {
+                args.extend(self.args()?);
+            }
+            expr = Spanned {
+                expr: Expr::Call { name, args },
+                pos,
+            };
+        }
+        Ok(expr)
+    }
+
+    fn primary(&mut self) -> Result<Spanned, Error> {
         let pos = self.pos();
         let Some((tok, _)) = self.tokens.get(self.i).cloned() else {
             return err(pos, "expected an expression");
@@ -162,21 +212,31 @@ impl Parser {
             Token::Num(n) => Expr::Num(n),
             Token::Duration(d) => Expr::Duration(d),
             Token::Ident(name) => {
-                self.expect(Token::LParen, &format!("'(' after '{name}'"))?;
-                let mut args = Vec::new();
-                if self.peek() != Some(&Token::RParen) {
-                    args.push(self.expr()?);
-                    while self.peek() == Some(&Token::Comma) {
-                        self.i += 1;
-                        args.push(self.expr()?);
-                    }
+                if self.peek() != Some(&Token::LParen) {
+                    return err(self.pos(), format!("expected '(' after '{name}'"));
                 }
-                self.expect(Token::RParen, "',' or ')'")?;
+                let args = self.args()?;
                 Expr::Call { name, args }
             }
             _ => return err(pos, "expected an expression"),
         };
         Ok(Spanned { expr, pos })
+    }
+
+    /// `( a, b, c )`, allowing a trailing comma.
+    fn args(&mut self) -> Result<Vec<Spanned>, Error> {
+        self.expect(Token::LParen, "'('")?;
+        let mut args = Vec::new();
+        while self.peek() != Some(&Token::RParen) {
+            args.push(self.expr()?);
+            match self.peek() {
+                Some(Token::Comma) => self.i += 1,
+                Some(Token::RParen) => {}
+                _ => return err(self.pos(), "expected ',' or ')'"),
+            }
+        }
+        self.i += 1;
+        Ok(args)
     }
 }
 
@@ -215,6 +275,64 @@ mod tests {
             panic!()
         };
         assert_eq!(args[1].expr, Expr::Duration(0.5));
+    }
+
+    #[test]
+    fn lexes_negative_numbers_and_decibels() {
+        let prog = parse("f(-0.5, -6db, 0db)").unwrap();
+        let Expr::Call { args, .. } = &prog[0].expr else {
+            panic!()
+        };
+        let nums: Vec<f64> = args
+            .iter()
+            .map(|a| match a.expr {
+                Expr::Num(n) => (n * 1000.0).round() / 1000.0,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(nums, [-0.5, 0.501, 1.0]);
+    }
+
+    /// Parse one expression and print it back in plain call syntax.
+    fn desugar(src: &str) -> String {
+        fn show(e: &Expr) -> String {
+            match e {
+                Expr::Call { name, args } => {
+                    let args: Vec<String> = args.iter().map(|a| show(&a.expr)).collect();
+                    format!("{name}({})", args.join(", "))
+                }
+                Expr::Str(s) => format!("{s:?}"),
+                Expr::Num(n) => n.to_string(),
+                Expr::Duration(d) => format!("{d}s"),
+            }
+        }
+        let prog = parse(src).unwrap();
+        assert_eq!(prog.len(), 1);
+        show(&prog[0].expr)
+    }
+
+    #[test]
+    fn method_calls_desugar_to_calls() {
+        assert_eq!(
+            desugar(r#"sample("k").fit(500ms).repeat(4).play"#),
+            r#"play(repeat(fit(sample("k"), 0.5s), 4))"#
+        );
+        assert_eq!(desugar("4.repeat"), "repeat(4)");
+        assert_eq!(desugar("x(.5).y(-.5)"), "y(x(0.5), -0.5)");
+    }
+
+    #[test]
+    fn trailing_commas() {
+        assert_eq!(desugar("add(\n  a(),\n  b(),\n)"), "add(a(), b())");
+        assert_eq!(desugar("add(a(),)"), "add(a())");
+        assert!(parse("add(,)").is_err());
+    }
+
+    #[test]
+    fn method_error_points_at_method_name() {
+        let prog = parse("a().fit").unwrap();
+        assert_eq!(prog[0].pos, 4);
+        assert_eq!(parse("a().(").unwrap_err().pos, 4);
     }
 
     #[test]

@@ -11,18 +11,28 @@ use std::sync::Arc;
 
 use crate::engine::Command;
 use crate::lang::{Error, Expr, Spanned};
-use crate::nodes::{Fit, Node, Repeat, SampleData, Sampler};
+use crate::nodes::{Add, Fit, Gain, Limit, Node, Repeat, SampleData, Sampler, Seq};
 use crate::sample;
 
 /// Fade-out applied where `fit` cuts a sound off. A few ms is enough to remove the
 /// click without audibly softening a transient.
 const FIT_FADE_SECONDS: f64 = 0.003;
 
+/// `limit` defaults: -1 dBFS ceiling, leaving a little room for the resampling
+/// and DACs that come after us.
+const LIMIT_CEILING: f64 = 0.891;
+const LIMIT_LOOKAHEAD_SECONDS: f64 = 0.005;
+const LIMIT_RELEASE_SECONDS: f64 = 0.1;
+
 #[derive(Clone)]
 pub enum Sound {
     Sample(Arc<SampleData>),
     Fit(Box<Sound>, f64),
     Repeat(Box<Sound>, usize),
+    Add(Vec<Sound>),
+    Seq(Vec<Sound>),
+    Gain(f64, Box<Sound>),
+    Limit(f64, Box<Sound>),
 }
 
 impl Sound {
@@ -38,6 +48,27 @@ impl Sound {
             Sound::Repeat(child, times) => {
                 Box::new(Repeat::new(child.instantiate(sample_rate), *times))
             }
+            Sound::Add(children) => Box::new(Add::new(
+                children
+                    .iter()
+                    .map(|c| c.instantiate(sample_rate))
+                    .collect(),
+            )),
+            Sound::Seq(children) => Box::new(Seq::new(
+                children
+                    .iter()
+                    .map(|c| c.instantiate(sample_rate))
+                    .collect(),
+            )),
+            Sound::Gain(amount, child) => {
+                Box::new(Gain::new(*amount as f32, child.instantiate(sample_rate)))
+            }
+            Sound::Limit(ceiling, child) => Box::new(Limit::new(
+                child.instantiate(sample_rate),
+                *ceiling as f32,
+                frames(LIMIT_LOOKAHEAD_SECONDS),
+                (LIMIT_RELEASE_SECONDS * sample_rate as f64) as f32,
+            )),
         }
     }
 }
@@ -104,58 +135,86 @@ impl Evaluator {
             values.push(self.eval(arg, commands)?);
         }
 
-        let expected = match name {
-            "sample" | "play" => 1,
-            "fit" | "repeat" => 2,
-            "stop" => 0,
+        let (min_args, max_args) = match name {
+            "stop" => (0, 0),
+            "sample" | "play" => (1, 1),
+            "fit" | "repeat" | "gain" => (2, 2),
+            "limit" => (1, 2),
+            "add" | "seq" => (0, usize::MAX),
             _ => return fail(format!("unknown function '{name}'")),
         };
-        if values.len() != expected {
+        if values.len() < min_args || values.len() > max_args {
+            let expected = match (min_args, max_args) {
+                (a, b) if a == b => format!("{a}"),
+                (a, b) => format!("{a} or {b}"),
+            };
             return fail(format!(
                 "{name} takes {expected} argument(s), got {}",
                 values.len()
             ));
         }
 
-        let mut values = values.into_iter();
-        let mut next = || values.next().unwrap();
         let wrong = |v: &Value, want: &str, n: usize| {
             Err(Error {
                 pos: args[n].pos,
                 msg: format!("{name}: expected {want}, got {}", v.type_name()),
             })
         };
+        let sound = |s: Sound| Ok(Value::Sound(s));
 
-        match name {
-            "sample" => match next() {
-                Value::Str(path) => match self.load(&path) {
-                    Ok(data) => Ok(Value::Sound(Sound::Sample(data))),
-                    Err(msg) => fail(msg),
-                },
-                v => wrong(&v, "a file name", 0),
+        match (name, values.as_slice()) {
+            ("sample", [Value::Str(path)]) => match self.load(path) {
+                Ok(data) => sound(Sound::Sample(data)),
+                Err(msg) => fail(msg),
             },
-            "fit" => match (next(), next()) {
-                (Value::Sound(s), Value::Duration(d)) => {
-                    Ok(Value::Sound(Sound::Fit(Box::new(s), d)))
+            ("sample", [v]) => wrong(v, "a file name", 0),
+
+            ("fit", [Value::Sound(s), Value::Duration(d)]) => {
+                sound(Sound::Fit(Box::new(s.clone()), *d))
+            }
+            ("fit", [Value::Sound(_), v]) => wrong(v, "a duration (like 500ms)", 1),
+            ("fit", [v, _]) => wrong(v, "a sound", 0),
+
+            ("repeat", [Value::Sound(s), Value::Num(n)]) if *n >= 0.0 && n.fract() == 0.0 => {
+                sound(Sound::Repeat(Box::new(s.clone()), *n as usize))
+            }
+            ("repeat", [Value::Sound(_), v]) => wrong(v, "a whole number", 1),
+            ("repeat", [v, _]) => wrong(v, "a sound", 0),
+
+            ("add" | "seq", _) => {
+                let mut children = Vec::with_capacity(values.len());
+                for (n, v) in values.iter().enumerate() {
+                    match v {
+                        Value::Sound(s) => children.push(s.clone()),
+                        v => return wrong(v, "a sound", n),
+                    }
                 }
-                (Value::Sound(_), v) => wrong(&v, "a duration (like 500ms)", 1),
-                (v, _) => wrong(&v, "a sound", 0),
-            },
-            "repeat" => match (next(), next()) {
-                (Value::Sound(s), Value::Num(n)) if n >= 0.0 && n.fract() == 0.0 => {
-                    Ok(Value::Sound(Sound::Repeat(Box::new(s), n as usize)))
-                }
-                (Value::Sound(_), v) => wrong(&v, "a whole number", 1),
-                (v, _) => wrong(&v, "a sound", 0),
-            },
-            "play" => match next() {
-                Value::Sound(s) => {
-                    commands.push(Command::Play(s.instantiate(self.sample_rate)));
-                    Ok(Value::Nothing)
-                }
-                v => wrong(&v, "a sound", 0),
-            },
-            "stop" => {
+                sound(match name {
+                    "add" => Sound::Add(children),
+                    _ => Sound::Seq(children),
+                })
+            }
+
+            ("gain", [Value::Sound(s), Value::Num(amount)]) => {
+                sound(Sound::Gain(*amount, Box::new(s.clone())))
+            }
+            ("gain", [Value::Sound(_), v]) => wrong(v, "an amount (like 0.5 or -6db)", 1),
+            ("gain", [v, _]) => wrong(v, "a sound", 0),
+
+            ("limit", [Value::Sound(s)]) => sound(Sound::Limit(LIMIT_CEILING, Box::new(s.clone()))),
+            ("limit", [Value::Sound(s), Value::Num(ceiling)]) if *ceiling > 0.0 => {
+                sound(Sound::Limit(*ceiling, Box::new(s.clone())))
+            }
+            ("limit", [Value::Sound(_), v]) => wrong(v, "a positive ceiling (like 0.9 or -1db)", 1),
+            ("limit", [v, ..]) => wrong(v, "a sound", 0),
+
+            ("play", [Value::Sound(s)]) => {
+                commands.push(Command::Play(s.instantiate(self.sample_rate)));
+                Ok(Value::Nothing)
+            }
+            ("play", [v]) => wrong(v, "a sound", 0),
+
+            ("stop", []) => {
                 commands.push(Command::StopAll);
                 Ok(Value::Nothing)
             }
@@ -176,5 +235,99 @@ impl Evaluator {
         let data = Arc::new(sample::load(Path::new(&path))?);
         self.cache.insert(path, data.clone());
         Ok(data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lang::parse;
+    use crate::nodes::Frame;
+
+    fn evaluator() -> Evaluator {
+        let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples");
+        Evaluator::new(48_000, vec![samples])
+    }
+
+    /// Evaluate `src` (which must `play` exactly one sound) and render it.
+    fn render(src: &str) -> Vec<Frame> {
+        let mut commands = evaluator().run(&parse(src).unwrap()).unwrap();
+        let Some(Command::Play(mut node)) = commands.pop() else {
+            panic!("nothing played")
+        };
+        let mut all = Vec::new();
+        let mut buf = vec![[0.0; 2]; 512];
+        loop {
+            let n = node.process(&mut buf);
+            all.extend_from_slice(&buf[..n]);
+            if n < buf.len() {
+                return all;
+            }
+        }
+    }
+
+    fn peak(frames: &[Frame]) -> f32 {
+        frames.iter().flatten().fold(0.0, |m, s| m.max(s.abs()))
+    }
+
+    fn error(src: &str) -> String {
+        match evaluator().run(&parse(src).unwrap()) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e.msg,
+        }
+    }
+
+    #[test]
+    fn add_and_gain() {
+        let kick = peak(&render(r#"play(sample("kick.mp3"))"#));
+        let four = peak(&render(
+            r#"play(add(sample("kick.mp3"), sample("kick.mp3"), sample("kick.mp3"), sample("kick.mp3")))"#,
+        ));
+        assert!((four - 4.0 * kick).abs() < 1e-4);
+        let half = peak(&render(r#"sample("kick.mp3").gain(-6db).play"#));
+        assert!((half - 0.501 * kick).abs() < 1e-3);
+    }
+
+    #[test]
+    fn limit_tames_a_loud_mix() {
+        let loud = r#"add(sample("kick.mp3"), sample("kick.mp3"), sample("kick.mp3"))"#;
+        assert!(peak(&render(&format!("play({loud})"))) > 1.5);
+        assert!(peak(&render(&format!("{loud}.limit.play"))) <= 0.892);
+        assert!(peak(&render(&format!("{loud}.limit(-6db).play"))) <= 0.502);
+    }
+
+    #[test]
+    fn argument_errors() {
+        assert_eq!(
+            error(r#"sample("kick.mp3").gain(sample("kick.mp3"))"#),
+            "gain: expected an amount (like 0.5 or -6db), got a sound"
+        );
+        assert_eq!(
+            error(r#"0.5.gain(sample("kick.mp3"))"#),
+            "gain: expected a sound, got a number"
+        );
+        assert_eq!(
+            error(r#"seq(sample("kick.mp3"), 3)"#),
+            "seq: expected a sound, got a number"
+        );
+        assert_eq!(
+            error("add().limit(0)"),
+            "limit: expected a positive ceiling (like 0.9 or -1db), got a number"
+        );
+        assert_eq!(error("limit()"), "limit takes 1 or 2 argument(s), got 0");
+    }
+
+    #[test]
+    fn seq_is_as_long_as_its_parts() {
+        let frames =
+            render(r#"seq(sample("kick.mp3").fit(100ms), sample("kick.mp3").fit(250ms),).play"#);
+        assert_eq!(frames.len(), 4_800 + 12_000);
+    }
+
+    #[test]
+    fn both_call_styles_are_equivalent() {
+        let a = render(r#"play(repeat(fit(gain(sample("kick.mp3"), 0.5), 100ms), 3))"#);
+        let b = render(r#"sample("kick.mp3").gain(0.5).fit(100ms).repeat(3).play"#);
+        assert_eq!(a, b);
     }
 }

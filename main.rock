@@ -2,8 +2,14 @@
 -- cmd-shift-enter run everything
 -- cmd-.           stop all sound
 
-play(sample("kick.mp3"))
+sample("kick.mp3").fit(500ms).play
 
-play(fit(sample("kick.mp3"), 500ms))
+seq(
+  sample("kick.mp3").fit(250ms),
+  sample("kick.mp3").fit(125ms).repeat(2),
+).repeat(2).play
 
-play(repeat(fit(sample("kick.mp3"), 500ms), 4))
+add(
+  sample("kick.mp3").gain(-12db).fit(500ms).repeat(4),
+  sample("kick.mp3").gain(-6db).fit(500ms).repeat(4),
+).limit.play

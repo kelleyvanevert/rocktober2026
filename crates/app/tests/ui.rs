@@ -144,22 +144,22 @@ mod macos {
         let before = h.text();
         h.press_at(6, 5, "cmd-enter");
         assert_eq!(h.text(), before, "cmd-enter must not edit the text");
-        assert_eq!(h.last_log(), r#"play(fit(sample("kick.mp3"), 500ms))"#);
+        assert_eq!(h.last_log(), r#"sample("kick.mp3").fit(500ms).play"#);
         h.snapshot("2-run-block");
 
         // A type error lands in the console with its position.
-        h.set_text("-- oops\nplay(sample(\"kick.mp3\"))\n\nplay(fit(sample(\"kick.mp3\"), 4))\n");
+        h.set_text("-- oops\nsample(\"kick.mp3\").play\n\nsample(\"kick.mp3\").fit(4).play\n");
         h.press_at(3, 0, "cmd-enter");
         assert_eq!(
             h.last_log(),
-            "4:30: fit: expected a duration (like 500ms), got a number"
+            "4:24: fit: expected a duration (like 500ms), got a number"
         );
         h.snapshot("3-error");
 
         // cmd-shift-enter runs everything; cmd-. stops.
-        h.set_text("play(sample(\"kick.mp3\"))\nplay(sample(\"kick.mp3\"))\n");
+        h.set_text("sample(\"kick.mp3\").play\nsample(\"kick.mp3\").play\n");
         h.press_at(0, 0, "cmd-shift-enter");
-        assert_eq!(h.last_log(), r#"play(sample("kick.mp3")) …"#);
+        assert_eq!(h.last_log(), r#"sample("kick.mp3").play …"#);
         h.press_at(0, 0, "cmd-.");
         assert_eq!(h.last_log(), "stop");
         h.snapshot("4-stop");

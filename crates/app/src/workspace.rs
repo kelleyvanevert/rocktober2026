@@ -22,11 +22,21 @@ const EXAMPLE: &str = r#"-- cmd-enter       run the selection, or the block unde
 -- cmd-shift-enter run everything
 -- cmd-.           stop all sound
 
-play(sample("kick.mp3"))
+sample("kick.mp3").play
 
-play(fit(sample("kick.mp3"), 500ms))
+sample("kick.mp3").fit(500ms).play
 
-play(repeat(fit(sample("kick.mp3"), 250ms), 4))
+sample("kick.mp3").fit(250ms).repeat(4).play
+
+seq(
+  sample("kick.mp3").fit(250ms),
+  sample("kick.mp3").fit(125ms).repeat(2),
+).repeat(2).play
+
+add(
+  sample("kick.mp3").gain(-6db),
+  sample("kick.mp3").fit(125ms).repeat(8),
+).limit.play
 "#;
 
 #[derive(Clone, Copy, PartialEq)]
