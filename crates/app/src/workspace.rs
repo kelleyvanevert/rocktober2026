@@ -17,14 +17,17 @@ use rocktober_engine::resource::{self, ResourceKind, ResourceRef, Resources};
 use crate::envelope_editor::EnvelopeEditor;
 use crate::modulation_editor::ModulationEditor;
 use crate::sample_editor::{OverviewCache, SampleEditor};
-use crate::{ResourceEvent, RunAll, RunBlock, Save, StopAll, ToggleRecording, blocks, comments};
+use crate::{
+    ResourceEvent, RunAll, RunBlock, Save, StopAll, StopBlock, ToggleRecording, blocks, comments,
+};
 
 const FLASH_DURATION: Duration = Duration::from_millis(250);
 const MAX_LOG_ENTRIES: usize = 500;
 
 const EXAMPLE: &str = r#"-- cmd-enter       run the selection, or the block under the cursor
 -- cmd-shift-enter run everything
--- cmd-.           stop all sound
+-- cmd-.           stop what the block plays into named slots (on the next bar)
+-- cmd-shift-.     stop all sound
 -- cmd-r           start/stop recording to recordings/
 
 sample("kick.mp3").play
@@ -286,7 +289,8 @@ impl Workspace {
         self.log.iter().map(|entry| entry.text.as_str())
     }
 
-    fn run_block(&mut self, _: &RunBlock, _: &mut Window, cx: &mut Context<Self>) {
+    /// The whole text, and the selection or else the block under the cursor.
+    fn current_block(&self, cx: &App) -> (String, Range<usize>) {
         let state = self.editor.read(cx);
         let text = state.value().to_string();
         let selection = state.selected_range();
@@ -295,7 +299,39 @@ impl Workspace {
         } else {
             selection
         };
+        (text, range)
+    }
+
+    fn run_block(&mut self, _: &RunBlock, _: &mut Window, cx: &mut Context<Self>) {
+        let (text, range) = self.current_block(cx);
         self.run(&text, range, cx);
+    }
+
+    /// Stop what the current block plays into named slots, without running it.
+    fn stop_block(&mut self, _: &StopBlock, _: &mut Window, cx: &mut Context<Self>) {
+        let (text, range) = self.current_block(cx);
+        let code = &text[range.clone()];
+        if code.trim().is_empty() {
+            return;
+        }
+        self.flash(range.clone(), cx);
+        let Some(session) = &mut self.session else {
+            self.push_log(LogKind::Error, "no audio device".into(), cx);
+            return;
+        };
+        match session.stop_named(code) {
+            Ok(names) if names.is_empty() => self.push_log(
+                LogKind::Info,
+                "nothing to stop: this block plays into no named slot (cmd-shift-. stops everything)"
+                    .into(),
+                cx,
+            ),
+            Ok(names) => {
+                self.set_error(None, cx);
+                self.push_log(LogKind::Info, format!("stop {}", names.join(", ")), cx);
+            }
+            Err(e) => self.report_error(range.start + e.pos, &e.msg, cx),
+        }
     }
 
     fn run_all(&mut self, _: &RunAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -378,17 +414,19 @@ impl Workspace {
                 self.set_error(None, cx);
                 self.push_log(LogKind::Ran, summary, cx);
             }
-            Err(e) => {
-                let at = range.start + e.pos;
-                let pos = self.editor.read(cx).text().offset_to_position(at);
-                self.set_error(Some(at), cx);
-                self.push_log(
-                    LogKind::Error,
-                    format!("{}:{}: {}", pos.line + 1, pos.character + 1, e.msg),
-                    cx,
-                );
-            }
+            Err(e) => self.report_error(range.start + e.pos, &e.msg, cx),
         }
+    }
+
+    /// Show an error at byte offset `at`: squiggle and console line.
+    fn report_error(&mut self, at: usize, msg: &str, cx: &mut Context<Self>) {
+        let pos = self.editor.read(cx).text().offset_to_position(at);
+        self.set_error(Some(at), cx);
+        self.push_log(
+            LogKind::Error,
+            format!("{}:{}: {msg}", pos.line + 1, pos.character + 1),
+            cx,
+        );
     }
 
     /// Briefly highlight the code that was just run.
@@ -673,6 +711,7 @@ impl Render for Workspace {
             .key_context("Workspace")
             .on_action(cx.listener(Self::run_block))
             .on_action(cx.listener(Self::run_all))
+            .on_action(cx.listener(Self::stop_block))
             .on_action(cx.listener(Self::stop_all))
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::toggle_recording))

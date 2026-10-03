@@ -66,6 +66,38 @@ pub enum Action {
     StopAll,
 }
 
+/// The slots a program plays into by name, like `.play("drums")` or
+/// `.play(lead, "lead")`, found by reading the code rather than running it: a
+/// call of `play` whose last argument (of at least two) is a string.
+pub fn named_slots(program: &[Spanned]) -> Vec<String> {
+    fn walk(e: &Spanned, out: &mut Vec<String>) {
+        match &e.expr {
+            Expr::Call { name, args } => {
+                if name == "play"
+                    && args.len() >= 2
+                    && let Some(Expr::Str(slot)) = args.last().map(|a| &a.expr)
+                    && !out.contains(slot)
+                {
+                    out.push(slot.clone());
+                }
+                for arg in args {
+                    walk(arg, out);
+                }
+            }
+            Expr::Let { value, .. } | Expr::Named { value, .. } => walk(value, out),
+            Expr::Hole {
+                default: Some(d), ..
+            } => walk(d, out),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for stmt in program {
+        walk(stmt, &mut out);
+    }
+    out
+}
+
 #[derive(Clone)]
 pub enum Sound {
     Sample(Arc<SampleData>),
@@ -1769,6 +1801,19 @@ mod tests {
             error_with(&mut ev, "stop"),
             "'stop' is a function: call it with stop(...)"
         );
+    }
+
+    #[test]
+    fn named_slots_are_found_without_running() {
+        let src = r#"
+            let hat = sample("hat.wav")
+            notes("x . x", 0.25b).play(hat, "hat")
+            sample("a.wav").play("pad")
+            sample("b.wav").play
+            notes("c2", 1b).play(lead)
+            sample("c.wav").play("pad")
+        "#;
+        assert_eq!(named_slots(&parse(src).unwrap()), ["hat", "pad"]);
     }
 
     #[test]

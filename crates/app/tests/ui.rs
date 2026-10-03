@@ -192,7 +192,7 @@ mod macos {
 
         // cmd-enter runs the block under the cursor, without inserting a newline.
         let before = h.text();
-        h.press_at(7, 5, "cmd-enter");
+        h.press_at(8, 5, "cmd-enter");
         assert_eq!(h.text(), before, "cmd-enter must not edit the text");
         assert_eq!(h.last_log(), r#"sample("kick.mp3").fit(500ms).play"#);
         h.snapshot("2-run-block");
@@ -206,13 +206,30 @@ mod macos {
         );
         h.snapshot("3-error");
 
-        // cmd-shift-enter runs everything; cmd-. stops.
+        // cmd-shift-enter runs everything; cmd-shift-. stops everything.
         h.set_text("sample(\"kick.mp3\").play\nsample(\"kick.mp3\").play\n");
         h.press_at(0, 0, "cmd-shift-enter");
         assert_eq!(h.last_log(), r#"sample("kick.mp3").play …"#);
-        h.press_at(0, 0, "cmd-.");
+        h.press_at(0, 0, "cmd-shift-.");
         assert_eq!(h.last_log(), "stop");
         h.snapshot("4-stop");
+
+        // cmd-. stops just what the block plays into named slots.
+        h.set_text(concat!(
+            "notes(\"x . x\", 0.25b).play(sample(\"kick.mp3\"), \"drums\")\n",
+            "sample(\"kick.mp3\").play(\"boom\")\n",
+            "\n",
+            "sample(\"kick.mp3\").play\n",
+        ));
+        h.press_at(0, 0, "cmd-enter");
+        h.press_at(0, 0, "cmd-.");
+        assert_eq!(h.last_log(), "stop drums, boom");
+        h.press_at(3, 0, "cmd-.");
+        assert!(
+            h.last_log().starts_with("nothing to stop"),
+            "{}",
+            h.last_log()
+        );
 
         // The cursor on a resource reference opens its editor below the code.
         h.set_text(concat!(

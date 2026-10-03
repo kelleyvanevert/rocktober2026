@@ -15,7 +15,7 @@ use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 use rtrb::Producer;
 
 use crate::engine::{Command, Engine, MAX_BLOCK, Slot, Status};
-use crate::eval::{Action, Evaluator};
+use crate::eval::{self, Action, Evaluator};
 use crate::lang;
 use crate::nodes::{Frame, Node};
 use crate::recorder::Recording;
@@ -58,10 +58,16 @@ impl Shared {
         let at = self.scheduler.clock.frame_at(beat);
         let slot = self.scheduler.slot(slot.as_deref());
         if slot != 0 {
-            self.scheduler.end_slot(slot, beat);
-            self.send(Command::StopSlot { slot, at });
+            self.stop_slot(slot, beat);
         }
         (beat, at, slot)
+    }
+
+    /// Stop a slot's patterns and voices at `beat`.
+    fn stop_slot(&mut self, slot: Slot, beat: f64) {
+        self.scheduler.end_slot(slot, beat);
+        let at = self.scheduler.clock.frame_at(beat);
+        self.send(Command::StopSlot { slot, at });
     }
 
     fn send(&mut self, cmd: Command) {
@@ -221,6 +227,21 @@ impl Session {
         Ok(())
     }
 
+    /// Stop what the code in `src` plays into named slots (see
+    /// `eval::named_slots`), on the next bar, without running it. Returns the
+    /// slot names.
+    pub fn stop_named(&mut self, src: &str) -> Result<Vec<String>, lang::Error> {
+        let names = eval::named_slots(&lang::parse(src)?);
+        let now = self.status.frames.load(Ordering::Relaxed);
+        let mut shared = self.shared();
+        let beat = shared.scheduler.start_beat(now);
+        for name in &names {
+            let slot = shared.scheduler.slot(Some(name));
+            shared.stop_slot(slot, beat);
+        }
+        Ok(names)
+    }
+
     /// The tempo, and the current position in beats.
     pub fn position(&self) -> (f64, f64) {
         let now = self.status.frames.load(Ordering::Relaxed);
@@ -368,6 +389,18 @@ mod tests {
         assert_eq!(session.shared().scheduler.patterns(), 1);
         session.stop_all();
         assert_eq!(session.shared().scheduler.patterns(), 0);
+
+        // Stopping a block's slots doesn't run it, so its pattern isn't added.
+        session.eval(drums).unwrap();
+        assert_eq!(session.stop_named(drums).unwrap(), ["drums"]);
+        session.shared().scheduler.due(20 * 48_000);
+        assert_eq!(session.shared().scheduler.patterns(), 0);
+        assert!(
+            session
+                .stop_named("sample(\"kick.mp3\").play")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The whole path, without a device: evaluate a pattern, then alternate

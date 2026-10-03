@@ -1,0 +1,108 @@
+-- Examples, 3 October 2026. Open with: cargo run -p rocktober -- examples.rock
+--
+-- Run a block with cmd-enter. Everything starts on the next bar, and a block
+-- that plays into a named slot ("kick", "chops", ...) replaces what played
+-- there, so you can edit a block and run it again. cmd-. stops everything.
+--
+-- The fragments of the recordings were picked at random (but not where it's
+-- silent). Put the cursor on a sample(...) to see where in the recording it is.
+
+100.bpm
+
+
+-- 1. A beat: the kick, a hi-hat from a train conductor's consonant, and a
+--    snare from a dog's bark (with a little room around it)
+
+notes("x . . x . . x .  x . . . x . . .", 0.25b).play(sample("kick.mp3").fit(300ms), "kick")
+
+let hat = sample("recordings/2026-07-23 Spanish speaking train conductor 1.m4a", 0:08:736, 0:10).fit(250ms).gain(-9db)
+notes(". . x . . . x x  . . x . . . x .", 0.25b).play(hat, "hat")
+
+let snare = sample("recordings/2026-08-31 Airplane bark.m4a", 0:04:707, 0:04:957).gain(-6db).reverb("small_room", 0.2)
+notes(". x", 1b).play(snare, "snare")
+
+
+-- 2. Chopped speech: seven fragments of conversations, cut to fit a bar
+
+seq(
+  sample("recordings/2026-08-29 Big dinner.m4a", 5:56:047, 13:55:297).fit(0.5b),
+  sample("recordings/2026-09-13 Pooja.m4a", 35:04:308, 35:04:558).fit(0.25b),
+  sample("recordings/2026-09-13 Pooja.m4a", 33:04:308).fit(0.25b),
+  sample("recordings/2026-10-02 Silje 5.m4a", 0:20:317, 0:24:717).fit(0.5b),
+--  sample("recordings/2026-07-23 Spanish speaking train conductor 2.m4a", 0:05:812, 0:06:062).fit(0.5b),
+--  sample("recordings/2026-05-18 Auke goede wens.m4a", 0:21:737, 0:22:137).fit(1b),
+--  sample("recordings/2026-08-24 Dinner convo w Silje, Carlota.m4a", 6:17:194, 6:17:894).fit(1b),
+).gain(-6db).repeat(inf).play("chops")
+
+
+
+
+
+
+-- 3. Stutter: one syllable, retriggered twice as fast every beat
+
+let syllable = sample("recordings/2026-10-02 Silje 4.m4a", 0:09:200, 0:14:705)
+seq(
+  syllable.fit(4b),
+  syllable.fit(1b).repeat(2),
+  syllable.fit(0.5b).repeat(4),
+  syllable.fit(0.25b).repeat(8),
+  syllable.fit(0.125b).repeat(16),
+).gain(0.3).play("stutter")
+
+
+-- 4. Plucked words: a fragment shaped by a short envelope, as a rhythm. (In a
+--    pattern, the envelope is released at the end of each step.)
+
+let word = sample("recordings/2026-07-23 Spanish speaking train conductor 3.m4a", 0:02:993, 0:03:393)
+notes("x . x x . x . x  x . x . x x x .", 0.25b).play(word * envelope("pluck"), "words")
+
+
+
+
+-- yes
+-- 8. Kicks played "through" a voice: a fragment of speech as the reverb's space
+
+let room = sample("recordings/2026-10-02 Silje 5.m4a", 0:20:317, 0:25)
+notes("x . x . x x . .", 0.25b).play(sample("kick.mp3").fit(200ms).reverb(room, 0.5).gain(2), "kick")
+
+
+-- 9. A wavetable bass. Its warp comes from a slow rising modulation, but
+--    latched: each note takes the value at its start and holds it.
+
+let bass = wavetable("basic", 0.6, modulation("rise").repeat(inf).latch, ?note) * envelope("pluck")
+notes("c2 . c2 c3  . c2 eb2 .  c2 . c2 c3  . bb1 g1 .", 0.25b).play(bass, "bass")
+
+
+-- 10. A lead whose wavetable position runs freely through your "sweep"
+--     modulation, across the notes, shaped by your "kelley" envelope
+
+let lead = wavetable("bright", modulation("sweep").repeat(inf), 0.2, ?note) * envelope("kelley") * 0.6
+notes("g4 _ eb4 c4  . g4 f4 eb4  d4 _ _ .  c4 d4 eb4 .", 0.25b).play(lead, "lead")
+
+
+-- 11. The same idea, retriggered: the modulation starts over with every note
+
+let blip = wavetable("pulse", modulation("wobble").retrig, 0, ?note) * envelope("pluck") * 0.5
+notes("c5 c5 c5 c5  eb5 eb5 g5 g5", 0.25b).play(blip, "blip")
+
+
+-- 12. A pad: three patterns of long notes make the chords (one note per
+--     pattern for now). ?pos has a default; fill it to make it brighter.
+
+let pad = wavetable("sine-saw", ?pos = 0.3, 0, ?note) * envelope("pad") * 0.3
+notes("c3 _ _ _ _ _ _ _  ab2 _ _ _ _ _ _ _", 1b).play(pad, "pad1")
+notes("eb3 _ _ _ _ _ _ _  c3 _ _ _ _ _ _ _", 1b).play(pad, "pad2")
+notes("g3 _ _ _ _ _ _ _  eb3 _ _ _ _ _ _ _", 1b).play(pad.with(pos: 0.7), "pad3")
+
+
+-- 13. The gong, now and then, in a lot of space
+
+let gong = sample("recordings/2026-09-25 Gong sound 2.m4a", 0:08:672, 0:10:000).gain(-3db).reverb("cathedral", 0.8)
+notes("x . . .", 2b).play(gong, "gong")
+
+
+
+-- 15. Silence one part: replace its slot with something that's over at once
+
+sample("kick.mp3").fit(1ms).play("lead")
