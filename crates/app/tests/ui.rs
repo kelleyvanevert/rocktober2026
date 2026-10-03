@@ -20,6 +20,8 @@ mod macos {
     use gpui_kit::*;
     use rocktober::workspace::Workspace;
     use rocktober_engine::Session;
+    use rocktober_engine::envelope::Envelope;
+    use rocktober_engine::modulation::Modulation;
 
     struct Harness {
         // Fields drop in order: the entity handle must go before the app context,
@@ -91,6 +93,49 @@ mod macos {
                 .unwrap();
         }
 
+        /// Put the cursor at (line, column), both 0-based, and let any loading
+        /// that starts finish.
+        fn move_to(&mut self, line: u32, column: u32) {
+            let editor = self
+                .cx
+                .update(|cx| self.workspace.read(cx).editor().clone());
+            self.cx
+                .update_window(self.window, |_, window, cx| {
+                    editor.update(cx, |state, cx| {
+                        state.set_cursor_position(Position::new(line, column), window, cx)
+                    });
+                    window.render_frame(cx);
+                })
+                .unwrap();
+            self.cx.run_until_parked();
+        }
+
+        /// The name of the resource under the cursor, and whether it's a
+        /// sample that loaded.
+        fn resource(&mut self) -> Option<(String, bool)> {
+            self.cx.update(|cx| {
+                let workspace = self.workspace.read(cx);
+                let name = workspace.resource()?.name.clone();
+                Some((name, workspace.sample_loaded(cx)))
+            })
+        }
+
+        /// Do something with the window, then draw a frame.
+        fn with_window(&mut self, f: impl FnOnce(&mut Window, &mut App)) {
+            self.cx
+                .update_window(self.window, |_, window, cx| {
+                    f(window, cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+        }
+
+        fn bounds_of(&mut self, id: &'static str) -> Bounds<Pixels> {
+            let mut bounds = None;
+            self.with_window(|window, _| bounds = Some(window.find(id).bounds()));
+            bounds.unwrap()
+        }
+
         fn text(&mut self) -> String {
             self.cx.update(|cx| {
                 self.workspace
@@ -142,7 +187,7 @@ mod macos {
 
         // cmd-enter runs the block under the cursor, without inserting a newline.
         let before = h.text();
-        h.press_at(6, 5, "cmd-enter");
+        h.press_at(7, 5, "cmd-enter");
         assert_eq!(h.text(), before, "cmd-enter must not edit the text");
         assert_eq!(h.last_log(), r#"sample("kick.mp3").fit(500ms).play"#);
         h.snapshot("2-run-block");
@@ -163,6 +208,74 @@ mod macos {
         h.press_at(0, 0, "cmd-.");
         assert_eq!(h.last_log(), "stop");
         h.snapshot("4-stop");
+
+        // The cursor on a resource reference opens its editor below the code.
+        h.set_text(concat!(
+            "sample(\"kick.mp3\", 0:00:100).gain(-6db).play\n",
+            "\n",
+            "sample(\"nope.wav\").play\n",
+            "\n",
+            "envelope(\"pluck\")\n",
+        ));
+        h.move_to(0, 3);
+        assert_eq!(h.resource(), Some(("kick.mp3".into(), true)));
+        h.snapshot("5-sample");
+        h.move_to(2, 10);
+        assert_eq!(h.resource(), Some(("nope.wav".into(), false)));
+        h.snapshot("6-missing-sample");
+        h.move_to(4, 0);
+        assert_eq!(h.resource(), Some(("pluck".into(), false)));
+        h.move_to(1, 0);
+        assert_eq!(h.resource(), None);
+
+        // A missing envelope can be created, then edited by dragging.
+        let envelopes = h.out.join("envelopes");
+        let modulations = h.out.join("modulations");
+        let _ = std::fs::remove_dir_all(&envelopes);
+        let _ = std::fs::remove_dir_all(&modulations);
+        h.set_text("envelope(\"pluck\")\n\nmodulation(\"sweep\")\n");
+        h.move_to(0, 3);
+        h.snapshot("7-missing-envelope");
+        h.with_window(|window, cx| window.click("create", cx));
+        let pluck = envelopes.join("pluck.json");
+        assert_eq!(Envelope::load(&pluck).unwrap(), Envelope::default());
+
+        // Drag the end of the release 40 pixels to the right. (This repeats the
+        // editor's layout: an 8px inset, 20% of the width for the sustain, and
+        // all stages taking 80% of the rest.)
+        let b = h.bounds_of("envelope-curve");
+        let width = b.size.width.as_f32() - 16.0;
+        let pixels_per_second = width * 0.8 / (1.201 * 1.25);
+        let release_end = b.origin.x.as_f32() + 8.0 + 1.201 * pixels_per_second + 0.2 * width;
+        let floor = b.bottom().as_f32() - 8.0;
+        h.with_window(|window, cx| {
+            window.drag(
+                point(px(release_end), px(floor)),
+                point(px(release_end + 40.0), px(floor)),
+                cx,
+            )
+        });
+        let release = Envelope::load(&pluck).unwrap().release.time;
+        let expected = 0.6 + 40.0 / pixels_per_second as f64;
+        assert!(
+            (release - expected).abs() < 0.005,
+            "{release} vs {expected}"
+        );
+        h.snapshot("8-envelope");
+
+        // Same for a modulation; clicking adds a point.
+        h.move_to(2, 3);
+        h.with_window(|window, cx| window.click("create", cx));
+        let sweep = modulations.join("sweep.json");
+        assert_eq!(Modulation::load(&sweep).unwrap(), Modulation::default());
+        let b = h.bounds_of("modulation-curve");
+        let center = b.center();
+        h.with_window(|window, cx| window.drag(center, center + point(px(0.), px(-30.)), cx));
+        let m = Modulation::load(&sweep).unwrap();
+        assert_eq!(m.points.len(), 3);
+        assert!((m.points[1].at - 0.5).abs() < 0.01);
+        assert!(m.points[1].value > 0.6, "{:?}", m.points[1]);
+        h.snapshot("9-modulation");
 
         println!("ui: passed");
     }

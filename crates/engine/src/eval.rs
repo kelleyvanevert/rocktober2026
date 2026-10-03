@@ -13,7 +13,7 @@ use crate::engine::Command;
 use crate::lang::{Error, Expr, Spanned};
 use crate::nodes::{Add, Delay, Fit, Gain, Limit, Node, Repeat, SampleData, Sampler, Seq, Slice};
 use crate::reverb::{self, Impulse, MAX_IR_SECONDS, Reverb};
-use crate::sample;
+use crate::{resource, sample};
 
 /// Fade-out applied where `fit` cuts a sound off. A few ms is enough to remove the
 /// click without audibly softening a transient.
@@ -139,6 +139,11 @@ impl Evaluator {
             cache: HashMap::new(),
             spaces: HashMap::new(),
         }
+    }
+
+    /// Where `sample("...")` looks for files, in order.
+    pub fn sample_dirs(&self) -> &[PathBuf] {
+        &self.sample_dirs
     }
 
     /// Evaluate a program, returning the commands it wants sent to the audio thread.
@@ -364,11 +369,7 @@ impl Evaluator {
         start: f64,
         end: Option<f64>,
     ) -> Result<Arc<SampleData>, String> {
-        let path = self
-            .sample_dirs
-            .iter()
-            .map(|dir| dir.join(name))
-            .find(|p| p.is_file())
+        let path = resource::find(&self.sample_dirs, name)
             .ok_or_else(|| format!("sample '{name}' not found in {:?}", self.sample_dirs))?;
         let key = (path, (start.to_bits(), end.map(f64::to_bits)));
         if let Some(data) = self.cache.get(&key) {

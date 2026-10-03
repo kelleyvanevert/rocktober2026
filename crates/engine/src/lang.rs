@@ -55,7 +55,7 @@ fn err<T>(pos: usize, msg: impl Into<String>) -> Result<T, Error> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Token {
+pub(crate) enum Token {
     Ident(String),
     Str(String),
     Num(f64),
@@ -88,7 +88,7 @@ fn parse_time(text: &str) -> Option<f64> {
     }
 }
 
-fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
+pub(crate) fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
     let bytes = src.as_bytes();
     let mut tokens = Vec::new();
     let mut i = 0;

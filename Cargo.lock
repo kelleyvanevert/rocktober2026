@@ -5922,6 +5922,8 @@ dependencies = [
  "hound",
  "realfft",
  "rtrb",
+ "serde",
+ "serde_json",
  "symphonia",
 ]
 

@@ -116,6 +116,11 @@ impl Session {
         Ok(())
     }
 
+    /// Where `sample("...")` looks for files, in order.
+    pub fn sample_dirs(&self) -> &[PathBuf] {
+        self.evaluator.sample_dirs()
+    }
+
     /// Fade out everything that's playing.
     pub fn stop_all(&mut self) {
         self.send(Command::StopAll);

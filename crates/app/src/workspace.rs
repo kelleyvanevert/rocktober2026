@@ -12,8 +12,12 @@ use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rocktober_engine::Session;
+use rocktober_engine::resource::{self, ResourceKind, ResourceRef};
 
-use crate::{RunAll, RunBlock, Save, StopAll, ToggleRecording, blocks, comments};
+use crate::envelope_editor::EnvelopeEditor;
+use crate::modulation_editor::ModulationEditor;
+use crate::sample_editor::{OverviewCache, SampleEditor};
+use crate::{ResourceEvent, RunAll, RunBlock, Save, StopAll, ToggleRecording, blocks, comments};
 
 const FLASH_DURATION: Duration = Duration::from_millis(250);
 const MAX_LOG_ENTRIES: usize = 500;
@@ -52,6 +56,22 @@ struct LogEntry {
     text: SharedString,
 }
 
+/// The resource under the cursor, shown in the panel below the code.
+struct OpenResource {
+    /// With its range in the whole text.
+    reference: ResourceRef,
+    view: ResourceView,
+    _subscription: Option<Subscription>,
+}
+
+enum ResourceView {
+    Sample(Entity<SampleEditor>),
+    Envelope(Entity<EnvelopeEditor>),
+    Modulation(Entity<ModulationEditor>),
+    /// A kind of resource that has no editor yet.
+    Unsupported,
+}
+
 pub struct Workspace {
     path: PathBuf,
     dirty: bool,
@@ -59,6 +79,11 @@ pub struct Workspace {
     flash: RangeDecorationCollection,
     comments: TextDecorationCollection,
     error: TextDecorationCollection,
+    /// A frame around the resource reference under the cursor.
+    resource_frame: RangeDecorationCollection,
+    framed: Option<Range<usize>>,
+    resource: Option<OpenResource>,
+    overviews: OverviewCache,
     /// Bumped on every flash, so an old flash's timer doesn't clear a newer one.
     flash_generation: u64,
     session: Option<Session>,
@@ -133,23 +158,30 @@ impl Workspace {
             state.focus(window, cx);
             state
         });
-        let (flash, comments, error) = editor.update(cx, |state, cx| {
+        let (flash, comments, error, resource_frame) = editor.update(cx, |state, cx| {
             (
                 state.create_range_decorations_collection(vec![], cx),
                 state.create_decorations_collection(vec![], cx),
                 state.create_decorations_collection(vec![], cx),
+                state.create_range_decorations_collection(vec![], cx),
             )
         });
 
-        let subscriptions = vec![cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
-            if let InputEvent::Change = event {
-                this.highlight_comments(cx);
-                if !this.dirty {
-                    this.dirty = true;
-                    cx.notify();
+        let subscriptions = vec![
+            cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
+                if let InputEvent::Change = event {
+                    this.highlight_comments(cx);
+                    if !this.dirty {
+                        this.dirty = true;
+                        cx.notify();
+                    }
                 }
-            }
-        })];
+            }),
+            // There's no event for cursor moves, but the editor redraws on them.
+            cx.observe_in(&editor, window, |this, _, window, cx| {
+                this.update_resource(window, cx)
+            }),
+        ];
 
         // The audio thread can't call us, so poll its voice count for the status bar.
         cx.spawn(async move |this, cx| {
@@ -177,13 +209,17 @@ impl Workspace {
         })
         .detach();
 
-        let workspace = Self {
+        let mut workspace = Self {
             path,
             dirty: false,
             editor,
             flash,
             comments,
             error,
+            resource_frame,
+            framed: None,
+            resource: None,
+            overviews: OverviewCache::default(),
             flash_generation: 0,
             session,
             voices: 0,
@@ -193,6 +229,7 @@ impl Workspace {
             _subscriptions: subscriptions,
         };
         workspace.highlight_comments(cx);
+        workspace.update_resource(window, cx);
         workspace
     }
 
@@ -207,6 +244,27 @@ impl Workspace {
             state.set_value(text.to_string(), window, cx)
         });
         self.highlight_comments(cx);
+    }
+
+    /// The resource reference under the cursor, if any.
+    pub fn resource(&self) -> Option<&ResourceRef> {
+        self.resource.as_ref().map(|open| &open.reference)
+    }
+
+    /// Whether the sample under the cursor has been loaded and drawn.
+    pub fn sample_loaded(&self, cx: &App) -> bool {
+        match self.resource.as_ref().map(|open| &open.view) {
+            Some(ResourceView::Sample(editor)) => editor.read(cx).is_loaded(),
+            _ => false,
+        }
+    }
+
+    /// The folder of the code file, where its resources live.
+    fn code_dir(&self) -> PathBuf {
+        match self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            Some(dir) => dir.to_path_buf(),
+            None => PathBuf::from("."),
+        }
     }
 
     /// The console contents, oldest first.
@@ -240,6 +298,7 @@ impl Workspace {
     }
 
     fn toggle_recording(&mut self, _: &ToggleRecording, _: &mut Window, cx: &mut Context<Self>) {
+        let dir = self.code_dir().join("recordings");
         let Some(session) = &mut self.session else {
             self.push_log(LogKind::Error, "no audio device".into(), cx);
             return;
@@ -254,10 +313,6 @@ impl Workspace {
             );
             return;
         }
-        let dir = match self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            Some(dir) => dir.join("recordings"),
-            None => PathBuf::from("recordings"),
-        };
         let name = chrono::Local::now()
             .format("%Y-%m-%d %H.%M.%S.wav")
             .to_string();
@@ -344,6 +399,106 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// Follow the cursor: frame the resource reference it's on, and show that
+    /// resource's editor (or hide the panel if it's on none).
+    fn update_resource(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.editor.read(cx);
+        let text = state.value().to_string();
+        let cursor = state.cursor();
+        let block = blocks::block_at(&text, cursor);
+        let found =
+            resource::reference_at(&text[block.clone()], cursor - block.start).map(|mut r| {
+                r.range = r.range.start + block.start..r.range.end + block.start;
+                r
+            });
+
+        // Only touch the decorations when they change: setting them redraws the
+        // editor, which would bring us right back here.
+        let range = found.as_ref().map(|r| r.range.clone());
+        if range != self.framed {
+            let color = cx.theme().muted_foreground.opacity(0.6);
+            let frame = range.clone().map(|range| {
+                RangeDecoration::new(range)
+                    .with_style(RangeDecorationStyle::Frame)
+                    .with_color(color)
+            });
+            self.resource_frame.set(frame.into_iter().collect(), cx);
+            self.framed = range;
+        }
+
+        let Some(found) = found else {
+            if self.resource.take().is_some() {
+                cx.notify();
+            }
+            return;
+        };
+        if let Some(open) = &mut self.resource
+            && open.reference.kind == found.kind
+            && open.reference.name == found.name
+        {
+            if let ResourceView::Sample(editor) = &open.view {
+                editor.update(cx, |editor, cx| editor.set_times(found.times.clone(), cx));
+            }
+            open.reference = found;
+            return;
+        }
+        self.resource = Some(self.open_resource(found, window, cx));
+        cx.notify();
+    }
+
+    fn open_resource(
+        &mut self,
+        reference: ResourceRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> OpenResource {
+        let root = self.code_dir();
+        let name = reference.name.clone();
+        let (view, subscription) = match reference.kind {
+            ResourceKind::Sample => {
+                let dirs = match &self.session {
+                    Some(session) => session.sample_dirs().to_vec(),
+                    None => sample_dirs(&self.path),
+                };
+                let cache = self.overviews.clone();
+                let times = reference.times.clone();
+                let editor = cx.new(|cx| SampleEditor::new(&name, times, &dirs, &root, cache, cx));
+                let subscription = self.log_resource_events(&editor, cx);
+                (ResourceView::Sample(editor), Some(subscription))
+            }
+            ResourceKind::Envelope => {
+                let editor = cx.new(|_| EnvelopeEditor::new(&name, &root));
+                let subscription = self.log_resource_events(&editor, cx);
+                (ResourceView::Envelope(editor), Some(subscription))
+            }
+            ResourceKind::Modulation => {
+                let editor = cx.new(|cx| ModulationEditor::new(&name, &root, window, cx));
+                let subscription = self.log_resource_events(&editor, cx);
+                (ResourceView::Modulation(editor), Some(subscription))
+            }
+            ResourceKind::Wavetable | ResourceKind::Midi => (ResourceView::Unsupported, None),
+        };
+        OpenResource {
+            reference,
+            view,
+            _subscription: subscription,
+        }
+    }
+
+    fn log_resource_events<E: EventEmitter<ResourceEvent>>(
+        &mut self,
+        editor: &Entity<E>,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe(editor, |this, _, event: &ResourceEvent, cx| {
+            let (kind, text) = match event {
+                ResourceEvent::Info(text) => (LogKind::Info, text.clone()),
+                ResourceEvent::Error(text) => (LogKind::Error, text.clone()),
+            };
+            this.push_log(kind, text, cx);
+        })
     }
 
     /// Mute comments. Recomputed from scratch on every edit, which is plenty fast
@@ -437,6 +592,37 @@ impl Workspace {
             )
     }
 
+    fn render_resource(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let open = self.resource.as_ref()?;
+        let theme = cx.theme();
+        let content = match &open.view {
+            ResourceView::Sample(editor) => editor.clone().into_any_element(),
+            ResourceView::Envelope(editor) => editor.clone().into_any_element(),
+            ResourceView::Modulation(editor) => editor.clone().into_any_element(),
+            ResourceView::Unsupported => {
+                let kind = open.reference.kind.function();
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(format!(
+                        "{kind} \"{}\": there's no {kind} editor yet",
+                        open.reference.name
+                    ))
+                    .into_any_element()
+            }
+        };
+        Some(
+            div()
+                .h(px(200.))
+                .flex_shrink_0()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .child(content),
+        )
+    }
+
     fn render_log(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         div()
@@ -467,6 +653,7 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let resource = self.render_resource(cx);
         let log = self.render_log(cx);
         let status_bar = self.render_status_bar(cx);
         let theme = cx.theme();
@@ -488,6 +675,7 @@ impl Render for Workspace {
                     .text_size(theme.mono_font_size)
                     .child(Editor::new(&self.editor).appearance(false).h_full()),
             )
+            .children(resource)
             .child(log)
             .child(status_bar)
     }

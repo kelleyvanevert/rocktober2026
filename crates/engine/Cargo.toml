@@ -9,3 +9,5 @@ hound = "3.5.1"
 realfft = "3.5.0"
 rtrb = "0.4.0"
 symphonia = { version = "0.6.1", features = ["mp3", "aac", "alac", "isomp4", "aiff"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"

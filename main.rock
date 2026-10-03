@@ -13,7 +13,7 @@ add(
   .reverb(sample("kick.mp3")).gain(.3).limit.play
 
 
-sample("recordings/2026-09-25 Gong sound 2.m4a", 0:08:672).gain(-6db).reverb("cathedral").play
+sample("recordings/2026-09-25 Gong sound 2.m4a", 0:08:672, 0:09:252).gain(-6db).reverb("cathedral").play
 
 
 
@@ -21,8 +21,12 @@ sample("recordings/2026-09-25 Gong sound 2.m4a", 0:08:672).gain(-6db).reverb("ca
 -- silje sings
 sample("recordings/2026-10-02 Silje 3.m4a", 0:06:500, 0:16:500).reverb("cathedral").play
 
+sample("recordings/2026-10-02 Silje 3.m4a", 0:06:500, 0:07:500).slice(00:00:200, 00:00:300)
+  .repeat(inf).reverb("cathedral").play
+
 -- dramatic percussion
-sample("recordings/2026-09-25 Gong sound 2.m4a", 0:08:672).fit(150ms).gain(-15db).repeat(inf).reverb("cathedral").play
+sample("recordings/2026-09-25 Gong sound 2.m4a", 0:08:672, 0:08:971).fit(150ms).gain(-15db).repeat(inf).reverb("cathedral").play
+
 sample("recordings/2026-08-31 Airplane bark.m4a", 0:8, 0:9).gain(-6db).repeat(inf).play
 
 -- spanish speaking train conductor
@@ -58,3 +62,8 @@ sample("recordings/2026-05-19 Noa, Carlota.m4a", 2:14, 2:22:250).play
 
 -- kelley speaking flemish
 sample("recordings/2026-05-19 Noa, Carlota.m4a", 6:43:500, 6:46:950).play
+
+
+envelope("kelley")
+
+modulation("bla")

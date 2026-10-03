@@ -1,9 +1,19 @@
 pub mod blocks;
 pub mod comments;
+pub mod curve_view;
+pub mod envelope_editor;
+pub mod modulation_editor;
+pub mod sample_editor;
 pub mod workspace;
 
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
+
+/// Something a resource editor did that's worth a line in the console.
+pub enum ResourceEvent {
+    Info(String),
+    Error(String),
+}
 
 actions!(
     rocktober,
