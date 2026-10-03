@@ -48,14 +48,21 @@ pub struct ModulationPlayer {
 }
 
 impl ModulationPlayer {
-    pub fn new(data: Arc<Modulation>, times: usize, sample_rate: u32) -> Self {
+    /// Starting `start` frames in.
+    pub fn new(data: Arc<Modulation>, times: usize, start: usize, sample_rate: u32) -> Self {
         let length = (data.length * sample_rate as f64).max(1.0);
+        let passes = (start as f64 / length).floor() as usize;
+        let (passes, pos) = if passes >= times {
+            (times, length)
+        } else {
+            (passes, start as f64 - passes as f64 * length)
+        };
         Self {
             data,
             length,
-            pos: 0.0,
+            pos,
             times,
-            passes: 0,
+            passes,
         }
     }
 }
@@ -280,10 +287,15 @@ mod tests {
     #[test]
     fn modulation_plays_then_holds() {
         // 4 seconds at 1 Hz: 4 frames per pass.
-        let out = render(&mut ModulationPlayer::new(ramp(), 1, 1), 7);
+        let out = render(&mut ModulationPlayer::new(ramp(), 1, 0, 1), 7);
         assert_eq!(out, [0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0]);
-        let out = render(&mut ModulationPlayer::new(ramp(), 2, 1), 10);
+        let out = render(&mut ModulationPlayer::new(ramp(), 2, 0, 1), 10);
         assert_eq!(out, [0.0, 0.25, 0.5, 0.75, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0]);
+        // Picked up partway: two frames into the second pass.
+        let out = render(&mut ModulationPlayer::new(ramp(), 2, 6, 1), 4);
+        assert_eq!(out, [0.5, 0.75, 1.0, 1.0]);
+        let out = render(&mut ModulationPlayer::new(ramp(), 2, 100, 1), 2);
+        assert_eq!(out, [1.0, 1.0]);
     }
 
     #[test]
@@ -336,7 +348,7 @@ mod tests {
 
     #[test]
     fn params_compute_blocks() {
-        let mut p = Param::signal(Box::new(ModulationPlayer::new(ramp(), 1, 1)));
+        let mut p = Param::signal(Box::new(ModulationPlayer::new(ramp(), 1, 0, 1)));
         assert_eq!(p.next(3), 3);
         assert_eq!((p.get(0), p.get(2)), (0.0, 0.5));
         assert_eq!(p.skip(5000), 5000);

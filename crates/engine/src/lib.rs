@@ -1,3 +1,4 @@
+pub mod clock;
 pub mod control;
 pub mod curve;
 pub mod engine;
@@ -6,10 +7,12 @@ pub mod eval;
 pub mod lang;
 pub mod modulation;
 pub mod nodes;
+pub mod pattern;
 pub mod recorder;
 pub mod resource;
 pub mod reverb;
 pub mod sample;
+pub mod scheduler;
 mod session;
 pub mod wavetable;
 

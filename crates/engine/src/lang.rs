@@ -38,6 +38,8 @@ pub enum Expr {
     Num(f64),
     /// In seconds.
     Duration(f64),
+    /// A length in beats: `0.25b`, `1bar` (4 beats).
+    Beats(f64),
     /// A MIDI note number.
     Pitch(f64),
     /// A name given with `let`.
@@ -91,6 +93,7 @@ pub(crate) enum Token {
     Str(String),
     Num(f64),
     Duration(f64),
+    Beats(f64),
     LParen,
     RParen,
     Comma,
@@ -105,7 +108,7 @@ pub(crate) enum Token {
 }
 
 /// The MIDI note number of a note name like `c4` (60), `f#3` or `eb4`.
-fn pitch(text: &str) -> Option<f64> {
+pub fn note(text: &str) -> Option<f64> {
     let bytes = text.as_bytes();
     let (letter, rest) = bytes.split_first()?;
     let semitone = match letter {
@@ -229,6 +232,8 @@ pub(crate) fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                     "" => Token::Num(value),
                     "ms" => Token::Duration(value / 1000.0),
                     "s" => Token::Duration(value),
+                    "b" => Token::Beats(value),
+                    "bar" | "bars" => Token::Beats(value * 4.0),
                     // Decibels are just a way to write an amplitude factor.
                     "db" => Token::Num(10f64.powf(value / 20.0)),
                     unit => return err(unit_start, format!("unknown unit '{unit}'")),
@@ -249,7 +254,7 @@ pub(crate) fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                 let tok = match &src[start..i] {
                     "inf" => Token::Num(f64::INFINITY),
                     "let" => Token::Let,
-                    name => match pitch(name) {
+                    name => match note(name) {
                         Some(note) => Token::Pitch(note),
                         None => Token::Ident(name.to_string()),
                     },
@@ -373,6 +378,7 @@ impl Parser {
             Token::Str(s) => Expr::Str(s),
             Token::Num(n) => Expr::Num(n),
             Token::Duration(d) => Expr::Duration(d),
+            Token::Beats(b) => Expr::Beats(b),
             Token::Pitch(note) => Expr::Pitch(note),
             Token::Question => {
                 let Some(Token::Ident(name)) = self.peek().cloned() else {
@@ -503,6 +509,7 @@ mod tests {
                 Expr::Str(s) => format!("{s:?}"),
                 Expr::Num(n) => n.to_string(),
                 Expr::Duration(d) => format!("{d}s"),
+                Expr::Beats(b) => format!("{b}b"),
                 Expr::Pitch(note) => format!("note{note}"),
                 Expr::Var(name) => name.clone(),
                 Expr::Let { name, value } => format!("let {name} = {}", show(&value.expr)),
@@ -573,6 +580,14 @@ mod tests {
         assert!(parse("a() *").is_err());
         assert!(parse("(a()").is_err());
         assert_eq!(parse("a() * * b()").unwrap_err().pos, 6);
+    }
+
+    #[test]
+    fn beats() {
+        assert_eq!(
+            desugar("f(0.25b, 1bar, 2bars, 120.bpm)"),
+            "f(0.25b, 4b, 8b, bpm(120))"
+        );
     }
 
     #[test]

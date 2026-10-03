@@ -84,3 +84,12 @@ lead.with(warp: 0, note: c3).play
 lead.with(warp: 0.6, note: c2, pos: modulation("sweep")).play
 
 (wavetable("bright", modulation("sweep").repeat(inf), 0.3, c2 + 7) * 0.5).fit(8s).play
+
+
+120.bpm
+
+notes("x . x . x x . .", 0.5b).play(sample("kick.mp3").fit(150ms), "drums")
+
+let lead = wavetable("basic", modulation("sweep").repeat(inf), 0.5, ?note).gain(0.2) * envelope("kelley")
+
+notes("c3 e3 g3 _ b3 . g3 e3", 0.25b).play(lead, "lead")

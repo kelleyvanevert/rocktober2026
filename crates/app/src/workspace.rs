@@ -42,6 +42,14 @@ add(
   sample("kick.mp3").gain(-6db),
   sample("kick.mp3").fit(125ms).repeat(8),
 ).limit.play
+
+-- everything starts on the next bar; a named slot replaces what played there
+120.bpm
+
+notes("x . x . x x . .", 0.25b).play(sample("kick.mp3"), "drums")
+
+let lead = wavetable("basic", ?pos = 0.3, 0.2, ?note) * 0.5
+notes("c3 e3 g3 _ b3 . g3 e3", 0.25b).play(lead, "lead")
 "#;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -90,6 +98,8 @@ pub struct Workspace {
     voices: usize,
     /// Whole seconds recorded, as last shown (so the timer redraws once a second).
     recorded_secs: Option<u64>,
+    /// Tempo and position, as last shown: "120 bpm  3.2" (bar 3, beat 2).
+    clock: String,
     log: Vec<LogEntry>,
     log_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
@@ -176,9 +186,18 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
-                    .timer(Duration::from_millis(100))
+                    .timer(Duration::from_millis(50))
                     .await;
                 let alive = this.update(cx, |this, cx| {
+                    let clock = this.session.as_ref().map_or_else(String::new, |s| {
+                        let (bpm, beat) = s.position();
+                        let beats = beat.floor() as u64;
+                        format!("{bpm:.0} bpm  {}.{}", beats / 4 + 1, beats % 4 + 1)
+                    });
+                    if clock != this.clock {
+                        this.clock = clock;
+                        cx.notify();
+                    }
                     let voices = this.session.as_ref().map_or(0, |s| s.voices());
                     let recorded = this
                         .session
@@ -213,6 +232,7 @@ impl Workspace {
             session,
             voices: 0,
             recorded_secs: None,
+            clock: String::new(),
             log,
             log_scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -559,6 +579,7 @@ impl Workspace {
             .text_color(theme.muted_foreground)
             .child(format!("{file_name}{}", if self.dirty { " •" } else { "" }))
             .child(div().flex_1())
+            .child(self.clock.clone())
             .child(
                 div()
                     .id("record")

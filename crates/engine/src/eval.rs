@@ -21,14 +21,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
+use crate::clock::Clock;
 use crate::control::{self, Combine, ControlNode, EnvelopePlayer, ModulationPlayer, Param};
-use crate::engine::Command;
 use crate::envelope::Envelope;
 use crate::lang::{Error, Expr, Spanned};
 use crate::modulation::Modulation;
 use crate::nodes::{
     Add, Delay, Fit, Gain, Limit, Multiply, Node, Repeat, SampleData, Sampler, Seq, Slice,
 };
+use crate::pattern::Pattern;
 use crate::resource::{self, ResourceKind, Resources};
 use crate::reverb::{self, Impulse, MAX_IR_SECONDS, Reverb};
 use crate::sample;
@@ -46,6 +47,24 @@ const LIMIT_RELEASE_SECONDS: f64 = 0.1;
 
 /// Default `reverb` wet/dry mix.
 const REVERB_MIX: f64 = 0.3;
+
+/// What running code asks the session to do. Timing is the session's
+/// business: it starts things on the next bar.
+pub enum Action {
+    /// Play a sound. With a slot name, it replaces what's playing in that slot.
+    Play {
+        sound: Sound,
+        slot: Option<String>,
+    },
+    /// Play a pattern of notes with an instrument (see `Sound::for_note`).
+    Pattern {
+        pattern: Arc<Pattern>,
+        instrument: Sound,
+        slot: Option<String>,
+    },
+    Bpm(f64),
+    StopAll,
+}
 
 #[derive(Clone)]
 pub enum Sound {
@@ -109,6 +128,43 @@ impl Sound {
                 warp: f(warp),
                 pitch: f(pitch),
             },
+        }
+    }
+
+    /// The voice for one note of a pattern: `?note` filled in, envelopes
+    /// released after `gate` seconds, and free-running modulations picked up
+    /// where they are `since` seconds into the pattern. A sound that would go
+    /// on forever and has no envelope to end it is cut off at the gate.
+    pub fn for_note(&self, note: Option<f64>, gate: f64, since: f64) -> Sound {
+        let mut values = HashMap::new();
+        if let Some(note) = note {
+            values.insert("note".to_string(), Control::Constant(note));
+        }
+        let mut has_envelope = false;
+        let voice = self.map_controls(&mut |c| {
+            has_envelope |= c.has_envelope();
+            c.fill(&values).for_note(gate, since)
+        });
+        if !has_envelope && voice.is_endless() {
+            Sound::Fit(Box::new(voice), gate)
+        } else {
+            voice
+        }
+    }
+
+    /// Whether the sound never ends by itself (ignoring controls that might
+    /// end it).
+    fn is_endless(&self) -> bool {
+        match self {
+            Sound::Sample(_) | Sound::Fit(..) | Sound::Slice(..) => false,
+            Sound::Wavetable { .. } => true,
+            Sound::Repeat(child, times) => *times == usize::MAX || child.is_endless(),
+            Sound::Add(children) | Sound::Seq(children) => children.iter().any(Sound::is_endless),
+            Sound::Multiply(a, b) => a.is_endless() && b.is_endless(),
+            Sound::Delay(child, _)
+            | Sound::Gain(_, child)
+            | Sound::Limit(_, child)
+            | Sound::Reverb(child, ..) => child.is_endless(),
         }
     }
 
@@ -190,12 +246,29 @@ impl Sound {
     }
 }
 
+/// How a modulation in an instrument follows the notes of a pattern.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ModClock {
+    /// Runs on through the notes, from the start of the pattern.
+    Free,
+    /// Starts over with every note.
+    Retrig,
+    /// Its value at the start of each note, held for the note.
+    Latch,
+}
+
 /// A description of a control signal, the counterpart of `Sound`.
 #[derive(Clone)]
 pub enum Control {
     Constant(f64),
-    /// Played this many times, then held at its last value.
-    Modulation(Arc<Modulation>, usize),
+    /// Played `times` times, then held at its last value, starting `start`
+    /// seconds in.
+    Modulation {
+        data: Arc<Modulation>,
+        times: usize,
+        clock: ModClock,
+        start: f64,
+    },
     /// Released after the gate (in seconds), if it has one.
     Envelope(Arc<Envelope>, Option<f64>),
     Mul(Box<Control>, Box<Control>),
@@ -220,6 +293,83 @@ impl Control {
         }
     }
 
+    fn has_envelope(&self) -> bool {
+        match self {
+            Control::Envelope(..) => true,
+            Control::Mul(a, b) | Control::Add(a, b) => a.has_envelope() || b.has_envelope(),
+            Control::Hole {
+                default: Some(d), ..
+            } => d.has_envelope(),
+            _ => false,
+        }
+    }
+
+    /// See `Sound::for_note`.
+    fn for_note(&self, gate: f64, since: f64) -> Control {
+        match self {
+            Control::Envelope(env, None) => Control::Envelope(env.clone(), Some(gate)),
+            Control::Modulation {
+                data,
+                times,
+                clock,
+                start,
+            } => match clock {
+                ModClock::Retrig => self.clone(),
+                ModClock::Free => Control::Modulation {
+                    data: data.clone(),
+                    times: *times,
+                    clock: *clock,
+                    start: start + since,
+                },
+                ModClock::Latch => Control::Constant(data.value_after(start + since, *times)),
+            },
+            Control::Mul(a, b) => Control::Mul(
+                Box::new(a.for_note(gate, since)),
+                Box::new(b.for_note(gate, since)),
+            ),
+            Control::Add(a, b) => Control::Add(
+                Box::new(a.for_note(gate, since)),
+                Box::new(b.for_note(gate, since)),
+            ),
+            Control::Hole {
+                name,
+                default: Some(d),
+            } => Control::Hole {
+                name: name.clone(),
+                default: Some(Box::new(d.for_note(gate, since))),
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// The same control with every modulation in it following `clock`, or
+    /// `None` if there are no modulations in it.
+    fn with_clock(&self, clock: ModClock) -> Option<Control> {
+        match self {
+            Control::Modulation {
+                data, times, start, ..
+            } => Some(Control::Modulation {
+                data: data.clone(),
+                times: *times,
+                clock,
+                start: *start,
+            }),
+            Control::Mul(a, b) | Control::Add(a, b) => {
+                let (a2, b2) = (a.with_clock(clock), b.with_clock(clock));
+                if a2.is_none() && b2.is_none() {
+                    return None;
+                }
+                let a = Box::new(a2.unwrap_or_else(|| (**a).clone()));
+                let b = Box::new(b2.unwrap_or_else(|| (**b).clone()));
+                Some(match self {
+                    Control::Mul(..) => Control::Mul(a, b),
+                    _ => Control::Add(a, b),
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// The same control with the holes in `values` filled.
     fn fill(&self, values: &HashMap<String, Control>) -> Control {
         match self {
@@ -233,8 +383,16 @@ impl Control {
     pub fn instantiate(&self, sample_rate: u32) -> Box<dyn ControlNode> {
         match self {
             Control::Constant(v) => Box::new(control::Constant(*v as f32)),
-            Control::Modulation(data, times) => {
-                Box::new(ModulationPlayer::new(data.clone(), *times, sample_rate))
+            Control::Modulation {
+                data, times, start, ..
+            } => {
+                let start = (start * sample_rate as f64).round() as usize;
+                Box::new(ModulationPlayer::new(
+                    data.clone(),
+                    *times,
+                    start,
+                    sample_rate,
+                ))
             }
             Control::Envelope(env, gate) => {
                 let gate = gate.map(|seconds| (seconds * sample_rate as f64).round() as usize);
@@ -277,7 +435,9 @@ pub enum Type {
     Envelope,
     Number,
     Duration,
+    Beats,
     Pitch,
+    Pattern,
     String,
     /// `name: value`, for `with`.
     Binding,
@@ -292,6 +452,8 @@ impl Type {
             Type::Envelope => "an envelope",
             Type::Number => "a number",
             Type::Duration => "a duration",
+            Type::Beats => "a length in beats",
+            Type::Pattern => "a pattern",
             Type::Pitch => "a pitch",
             Type::String => "a string",
             Type::Binding => "a binding (like pos: 0.2)",
@@ -308,8 +470,10 @@ enum Value {
     Str(String),
     Num(f64),
     Duration(f64),
+    Beats(f64),
     /// A MIDI note number.
     Pitch(f64),
+    Pattern(Arc<Pattern>),
     Binding(String, Box<Value>),
     Nothing,
 }
@@ -323,6 +487,8 @@ impl Value {
             Value::Str(_) => Type::String,
             Value::Num(_) => Type::Number,
             Value::Duration(_) => Type::Duration,
+            Value::Beats(_) => Type::Beats,
+            Value::Pattern(_) => Type::Pattern,
             Value::Pitch(_) => Type::Pitch,
             Value::Binding(..) => Type::Binding,
             Value::Nothing => Type::Nothing,
@@ -332,6 +498,7 @@ impl Value {
     /// Whether this value can be passed where `ty` is expected.
     fn fits(&self, ty: Type) -> bool {
         self.ty() == ty
+            || (ty == Type::Duration && matches!(self, Value::Beats(_)))
             || (ty == Type::Control
                 && matches!(self, Value::Num(_) | Value::Pitch(_) | Value::Envelope(_)))
     }
@@ -368,10 +535,10 @@ impl Value {
         }
     }
 
-    fn duration(&self) -> f64 {
+    fn pattern(&self) -> Arc<Pattern> {
         match self {
-            Value::Duration(d) => *d,
-            _ => unreachable!("not a duration"),
+            Value::Pattern(p) => p.clone(),
+            _ => unreachable!("not a pattern"),
         }
     }
 
@@ -391,6 +558,7 @@ const SOUND: P = P(Type::Sound, "a sound");
 const CONTROL: P = P(Type::Control, "a control");
 const NUMBER: P = P(Type::Number, "a number");
 const NAME: P = P(Type::String, "a file name");
+const SLOT: P = P(Type::String, "a slot name (like \"drums\")");
 
 /// A built-in function signature.
 struct Builtin {
@@ -436,7 +604,9 @@ struct Call<'a> {
     positions: Vec<usize>,
     /// The call's own position.
     pos: usize,
-    commands: &'a mut Vec<Command>,
+    /// The tempo, for turning beats into seconds.
+    bpm: f64,
+    actions: &'a mut Vec<Action>,
 }
 
 impl Call<'_> {
@@ -462,6 +632,44 @@ impl Call<'_> {
 
     fn control(&self, i: usize) -> Control {
         self.args[i].control()
+    }
+
+    /// Argument `i` in seconds: a duration, or beats at the current tempo.
+    fn duration(&self, i: usize) -> f64 {
+        match &self.args[i] {
+            Value::Duration(d) => *d,
+            Value::Beats(b) => b * 60.0 / self.bpm,
+            _ => unreachable!("not a duration"),
+        }
+    }
+
+    /// The slot name in argument `i`, if it's there.
+    fn slot(&self, i: usize) -> Option<String> {
+        self.args.get(i).map(|v| v.str().to_string())
+    }
+}
+
+/// Holes in `sound` that have no value, other than `except`.
+fn unfilled(sound: &Sound, except: &str) -> Option<String> {
+    sound
+        .holes()
+        .into_iter()
+        .find(|(name, default)| !default && name != except)
+        .map(|(name, _)| name)
+}
+
+fn no_value(c: &Call, name: &str) -> Error {
+    Error {
+        pos: c.pos,
+        msg: format!("play: ?{name} has no value (fill it with .with({name}: ...))"),
+    }
+}
+
+/// Switch the modulations in a control to another clock.
+fn set_clock(c: &Call, clock: ModClock) -> Result<Value, Error> {
+    match c.control(0).with_clock(clock) {
+        Some(control) => Ok(Value::Control(control)),
+        None => Err(c.wrong(0, "a modulation")),
     }
 }
 
@@ -500,31 +708,99 @@ fn builtins() -> Vec<Builtin> {
     const BINDING: P = P(Type::Binding, "a binding (like pos: 0.2)");
 
     vec![
-        builtin("play", &[SOUND], 1, |ev, c| {
-            let unfilled: Vec<String> = c
-                .sound(0)
-                .holes()
-                .into_iter()
-                .filter(|(_, default)| !default)
-                .map(|(name, _)| name)
-                .collect();
-            if let Some(name) = unfilled.first() {
-                return Err(Error {
-                    pos: c.pos,
-                    msg: format!("play: ?{name} has no value (fill it with .with({name}: ...))"),
-                });
+        // Starts on the next bar. A named slot replaces what played in it.
+        builtin("play", &[SOUND, SLOT], 1, |_, c| {
+            if let Some(name) = unfilled(&c.sound(0), "") {
+                return Err(no_value(c, &name));
             }
-            let node = c.sound(0).instantiate(ev.sample_rate);
-            c.commands.push(Command::Play(node));
+            let (sound, slot) = (c.sound(0), c.slot(1));
+            c.actions.push(Action::Play { sound, slot });
             Ok(Value::Nothing)
         }),
+        builtin(
+            "play",
+            &[P(Type::Pattern, "a pattern or a sound"), SOUND, SLOT],
+            2,
+            |_, c| {
+                let (pattern, instrument) = (c.args[0].pattern(), c.sound(1));
+                if let Some(name) = unfilled(&instrument, "note") {
+                    return Err(no_value(c, &name));
+                }
+                let note = instrument
+                    .holes()
+                    .into_iter()
+                    .find(|(name, _)| name == "note");
+                if pattern.has_notes() && note.is_none() {
+                    return Err(c.fail(
+                        1,
+                        "the sound has no ?note for the pattern's notes (use x for hits without one)",
+                    ));
+                }
+                if pattern.has_unpitched_hits() && note.is_some_and(|(_, default)| !default) {
+                    return Err(c.fail(
+                        1,
+                        "the pattern has hits without a note (x), but ?note has no default",
+                    ));
+                }
+                let slot = c.slot(2);
+                c.actions.push(Action::Pattern {
+                    pattern,
+                    instrument,
+                    slot,
+                });
+                Ok(Value::Nothing)
+            },
+        ),
         builtin("stop", &[], 0, |_, c| {
-            c.commands.push(Command::StopAll);
+            c.actions.push(Action::StopAll);
             Ok(Value::Nothing)
+        }),
+        builtin(
+            "bpm",
+            &[P(Type::Number, "a tempo (like 120)")],
+            1,
+            |ev, c| {
+                let bpm = c.args[0].num();
+                if !(20.0..=999.0).contains(&bpm) {
+                    return Err(c.wrong(0, "a tempo between 20 and 999"));
+                }
+                ev.bpm = bpm;
+                c.actions.push(Action::Bpm(bpm));
+                Ok(Value::Nothing)
+            },
+        ),
+        builtin(
+            "notes",
+            &[
+                P(Type::String, "steps (like \"c2 e2 _ x .\")"),
+                P(Type::Beats, "a step length in beats (like 0.25b)"),
+            ],
+            2,
+            |_, c| {
+                let Value::Beats(step) = c.args[1] else {
+                    unreachable!()
+                };
+                if step <= 0.0 {
+                    return Err(c.wrong(1, "a step length above 0"));
+                }
+                match Pattern::parse(c.args[0].str(), step) {
+                    Ok(pattern) => Ok(Value::Pattern(Arc::new(pattern))),
+                    Err(msg) => Err(c.fail(0, msg)),
+                }
+            },
+        ),
+        builtin("retrig", &[P(Type::Control, "a modulation")], 1, |_, c| {
+            set_clock(c, ModClock::Retrig)
+        }),
+        builtin("latch", &[P(Type::Control, "a modulation")], 1, |_, c| {
+            set_clock(c, ModClock::Latch)
+        }),
+        builtin("free", &[P(Type::Control, "a modulation")], 1, |_, c| {
+            set_clock(c, ModClock::Free)
         }),
         builtin("sample", &[NAME, START, END], 1, |ev, c| {
-            let start = c.args.get(1).map_or(0.0, Value::duration);
-            let end = c.args.get(2).map(Value::duration);
+            let start = if c.args.len() > 1 { c.duration(1) } else { 0.0 };
+            let end = (c.args.len() > 2).then(|| c.duration(2));
             if end.is_some_and(|end| end <= start) {
                 return Err(c.wrong(2, "an end after the start"));
             }
@@ -547,7 +823,12 @@ fn builtins() -> Vec<Builtin> {
             &[P(Type::String, "a modulation name")],
             1,
             |ev, c| match ev.load_modulation(c.args[0].str()) {
-                Ok(m) => control(Control::Modulation(Arc::new(m), 1)),
+                Ok(m) => control(Control::Modulation {
+                    data: Arc::new(m),
+                    times: 1,
+                    clock: ModClock::Free,
+                    start: 0.0,
+                }),
                 Err(msg) => Err(c.fail(0, msg)),
             },
         ),
@@ -612,17 +893,17 @@ fn builtins() -> Vec<Builtin> {
             2,
             |_, c| {
                 let env = c.args[0].envelope();
-                control(Control::Envelope(env, Some(c.args[1].duration())))
+                control(Control::Envelope(env, Some(c.duration(1))))
             },
         ),
         builtin(
             "fit",
             &[SOUND, P(Type::Duration, "a duration (like 500ms)")],
             2,
-            |_, c| sound(Sound::Fit(Box::new(c.sound(0)), c.args[1].duration())),
+            |_, c| sound(Sound::Fit(Box::new(c.sound(0)), c.duration(1))),
         ),
         builtin("slice", &[SOUND, START, END], 3, |_, c| {
-            let (start, end) = (c.args[1].duration(), c.args[2].duration());
+            let (start, end) = (c.duration(1), c.duration(2));
             if end <= start {
                 return Err(c.wrong(2, "an end after the start"));
             }
@@ -632,7 +913,7 @@ fn builtins() -> Vec<Builtin> {
             "delay",
             &[SOUND, P(Type::Duration, "a duration (like 12s)")],
             2,
-            |_, c| sound(Sound::Delay(Box::new(c.sound(0)), c.args[1].duration())),
+            |_, c| sound(Sound::Delay(Box::new(c.sound(0)), c.duration(1))),
         ),
         // `repeat(inf)` repeats forever (well, usize::MAX times).
         builtin("repeat", &[SOUND, NUMBER], 2, |_, c| {
@@ -641,16 +922,38 @@ fn builtins() -> Vec<Builtin> {
         }),
         builtin(
             "repeat",
-            &[P(Type::Control, "a sound or a modulation"), NUMBER],
+            &[
+                P(Type::Control, "a sound, a modulation or a pattern"),
+                NUMBER,
+            ],
             2,
             |_, c| {
                 let times = repeat_count(c)?;
                 match c.control(0) {
-                    Control::Modulation(m, n) => {
-                        control(Control::Modulation(m, n.saturating_mul(times)))
-                    }
-                    _ => Err(c.wrong(0, "a sound or a modulation")),
+                    Control::Modulation {
+                        data,
+                        times: n,
+                        clock,
+                        start,
+                    } => control(Control::Modulation {
+                        data,
+                        times: n.saturating_mul(times),
+                        clock,
+                        start,
+                    }),
+                    _ => Err(c.wrong(0, "a sound, a modulation or a pattern")),
                 }
+            },
+        ),
+        builtin(
+            "repeat",
+            &[P(Type::Pattern, "a pattern"), NUMBER],
+            2,
+            |_, c| {
+                let times = repeat_count(c)?;
+                let mut pattern = (*c.args[0].pattern()).clone();
+                pattern.times = times;
+                Ok(Value::Pattern(Arc::new(pattern)))
             },
         ),
         Builtin {
@@ -804,6 +1107,8 @@ pub struct Evaluator {
     /// Wavetables by name (built-in) or path and modification time (files).
     /// Like samples, they're kept so they're never freed on the audio thread.
     wavetables: HashMap<String, Arc<Wavetable>>,
+    /// The tempo, for beats in durations.
+    bpm: f64,
     /// Values named with `let`. They live as long as the evaluator, so a block
     /// can use what an earlier one defined.
     vars: HashMap<String, Value>,
@@ -817,6 +1122,7 @@ impl Evaluator {
             cache: HashMap::new(),
             spaces: HashMap::new(),
             wavetables: HashMap::new(),
+            bpm: Clock::DEFAULT_BPM,
             vars: HashMap::new(),
         }
     }
@@ -828,24 +1134,30 @@ impl Evaluator {
     /// Evaluate a program, returning the commands it wants sent to the audio thread.
     /// Nothing is sent if any statement fails, so a typo never half-plays a line.
     /// (The same goes for `let`s: they only take effect if everything succeeds.)
-    pub fn run(&mut self, program: &[Spanned]) -> Result<Vec<Command>, Error> {
-        let vars = self.vars.clone();
-        let mut commands = Vec::new();
+    pub fn run(&mut self, program: &[Spanned]) -> Result<Vec<Action>, Error> {
+        let (vars, bpm) = (self.vars.clone(), self.bpm);
+        let mut actions = Vec::new();
         for stmt in program {
-            if let Err(e) = self.eval(stmt, &mut commands) {
+            if let Err(e) = self.eval(stmt, &mut actions) {
                 self.vars = vars;
+                self.bpm = bpm;
                 return Err(e);
             }
         }
-        Ok(commands)
+        Ok(actions)
     }
 
-    fn eval(&mut self, e: &Spanned, commands: &mut Vec<Command>) -> Result<Value, Error> {
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn eval(&mut self, e: &Spanned, actions: &mut Vec<Action>) -> Result<Value, Error> {
         let fail = |msg: String| Err(Error { pos: e.pos, msg });
         let (name, args) = match &e.expr {
             Expr::Str(s) => return Ok(Value::Str(s.clone())),
             Expr::Num(n) => return Ok(Value::Num(*n)),
             Expr::Duration(d) => return Ok(Value::Duration(*d)),
+            Expr::Beats(b) => return Ok(Value::Beats(*b)),
             Expr::Pitch(note) => return Ok(Value::Pitch(*note)),
             Expr::Var(name) => {
                 return match self.vars.get(name) {
@@ -857,14 +1169,14 @@ impl Evaluator {
                 };
             }
             Expr::Let { name, value } => {
-                let value = self.eval(value, commands)?;
+                let value = self.eval(value, actions)?;
                 self.vars.insert(name.clone(), value);
                 return Ok(Value::Nothing);
             }
             Expr::Hole { name, default } => {
                 let default = match default {
                     None => None,
-                    Some(d) => match self.eval(d, commands)? {
+                    Some(d) => match self.eval(d, actions)? {
                         v if v.fits(Type::Control) => Some(Box::new(v.control())),
                         v => {
                             return Err(Error {
@@ -881,7 +1193,7 @@ impl Evaluator {
                 return Ok(Value::Control(Control::Hole { name, default }));
             }
             Expr::Named { name, value } => {
-                let value = self.eval(value, commands)?;
+                let value = self.eval(value, actions)?;
                 return Ok(Value::Binding(name.clone(), Box::new(value)));
             }
             Expr::Call { name, args } => (name.as_str(), args),
@@ -894,7 +1206,7 @@ impl Evaluator {
 
         let mut values = Vec::with_capacity(args.len());
         for arg in args {
-            values.push(self.eval(arg, commands)?);
+            values.push(self.eval(arg, actions)?);
         }
 
         let n = values.len();
@@ -937,7 +1249,8 @@ impl Evaluator {
             args: values,
             positions: args.iter().map(|a| a.pos).collect(),
             pos: e.pos,
-            commands,
+            bpm: self.bpm,
+            actions,
         };
         (found.run)(self, &mut call)
     }
@@ -1122,11 +1435,17 @@ mod tests {
         all
     }
 
-    fn render_with(evaluator: &mut Evaluator, src: &str) -> Vec<Frame> {
-        let mut commands = evaluator.run(&parse(src).unwrap()).unwrap();
-        let Some(Command::Play(mut node)) = commands.pop() else {
+    /// The sound `src` plays (it must play exactly one).
+    fn played(evaluator: &mut Evaluator, src: &str) -> Sound {
+        let mut actions = evaluator.run(&parse(src).unwrap()).unwrap();
+        let Some(Action::Play { sound, .. }) = actions.pop() else {
             panic!("nothing played")
         };
+        sound
+    }
+
+    fn render_with(evaluator: &mut Evaluator, src: &str) -> Vec<Frame> {
+        let mut node = played(evaluator, src).instantiate(48_000);
         render_node(node.as_mut(), 48_000 * 60)
     }
 
@@ -1205,7 +1524,7 @@ mod tests {
         );
         assert_eq!(
             error(r#"play(4.repeat(2))"#),
-            "repeat: expected a sound or a modulation, got a number"
+            "repeat: expected a sound, a modulation or a pattern, got a number"
         );
     }
 
@@ -1261,12 +1580,11 @@ mod tests {
 
     #[test]
     fn repeat_inf_keeps_going() {
-        let mut commands = evaluator()
-            .run(&parse(r#"sample("kick.mp3").fit(10ms).repeat(inf).play"#).unwrap())
-            .unwrap();
-        let Some(Command::Play(mut node)) = commands.pop() else {
-            panic!()
-        };
+        let sound = played(
+            &mut evaluator(),
+            r#"sample("kick.mp3").fit(10ms).repeat(inf).play"#,
+        );
+        let mut node = sound.instantiate(48_000);
         // Ten minutes' worth of 10ms kicks, in big blocks: still going.
         let mut buf = vec![[0.0; 2]; 48_000];
         for _ in 0..600 {
@@ -1451,6 +1769,94 @@ mod tests {
             error_with(&mut ev, "stop"),
             "'stop' is a function: call it with stop(...)"
         );
+    }
+
+    #[test]
+    fn beats_follow_the_tempo() {
+        let mut ev = evaluator();
+        let fit = r#"sample("kick.mp3").fit(1b).play"#;
+        assert_eq!(render_with(&mut ev, fit).len(), 24_000);
+        run(&mut ev, "60.bpm");
+        assert_eq!(render_with(&mut ev, fit).len(), 48_000);
+        assert_eq!(
+            error_with(&mut ev, "10.bpm"),
+            "bpm: expected a tempo between 20 and 999, got a number"
+        );
+    }
+
+    #[test]
+    fn patterns_need_a_fitting_instrument() {
+        let (mut ev, root) = with_resources();
+        let lead = r#"wavetable("basic", 0, 0, ?note)"#;
+        assert_eq!(
+            error_with(&mut ev, r#"notes("c2 q", 0.25b)"#),
+            "notes: 'q' isn't a step (use notes like c2 or f#3, x, . or _)"
+        );
+        assert_eq!(
+            error_with(&mut ev, r#"notes("c2", 250ms)"#),
+            "notes: expected a step length in beats (like 0.25b), got a duration"
+        );
+        assert_eq!(
+            error_with(&mut ev, r#"notes("c2 e2", 0.5b).play(sample("ones.wav"))"#),
+            "play: the sound has no ?note for the pattern's notes (use x for hits without one)"
+        );
+        assert_eq!(
+            error_with(&mut ev, &format!(r#"notes("x", 0.5b).play({lead})"#)),
+            "play: the pattern has hits without a note (x), but ?note has no default"
+        );
+        assert_eq!(
+            error_with(
+                &mut ev,
+                r#"notes("c2", 0.5b).play(wavetable("basic", ?pos, 0, ?note))"#
+            ),
+            "play: ?pos has no value (fill it with .with(pos: ...))"
+        );
+        let actions = ev
+            .run(&parse(r#"notes("x . x x", 0.25b).play(sample("ones.wav"), "drums")"#).unwrap())
+            .unwrap();
+        let [Action::Pattern { pattern, slot, .. }] = actions.as_slice() else {
+            panic!()
+        };
+        assert_eq!((pattern.steps.len(), slot.as_deref()), (4, Some("drums")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn voices_for_notes() {
+        let (mut ev, root) = with_resources();
+        run(
+            &mut ev,
+            r#"let lead = wavetable("basic", 0, 0, ?note) * envelope("slow")"#,
+        );
+        // Released at the gate (0.5 s), then a second of release.
+        let voice = ev.vars["lead"].sound().for_note(Some(69.0), 0.5, 0.0);
+        let frames = render_node(voice.instantiate(48_000).as_mut(), 48_000 * 10);
+        assert_eq!(frames.len(), 72_000);
+
+        // A ramp from 0 to 1 over a second, on a sound that never ends: cut off
+        // at the gate. The note starts half a second into the pattern.
+        let mut ramp = |clock: &str| {
+            run(
+                &mut ev,
+                &format!(r#"let s = sample("ones.wav").repeat(inf) * modulation("ramp"){clock}"#),
+            );
+            let voice = ev.vars["s"].sound().for_note(None, 0.25, 0.5);
+            let frames = render_node(voice.instantiate(48_000).as_mut(), 48_000 * 10);
+            assert_eq!(frames.len(), 12_000);
+            (frames[0][0], frames[6_000][0])
+        };
+        let close = |(a, b): (f32, f32), (x, y): (f32, f32)| {
+            assert!((a - x).abs() < 1e-3 && (b - y).abs() < 1e-3, "{a}, {b}")
+        };
+        close(ramp(""), (0.5, 0.625));
+        close(ramp(".free"), (0.5, 0.625));
+        close(ramp(".retrig"), (0.0, 0.125));
+        close(ramp(".latch"), (0.5, 0.5));
+        assert_eq!(
+            error_with(&mut ev, "0.5.latch"),
+            "latch: expected a modulation, got a number"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

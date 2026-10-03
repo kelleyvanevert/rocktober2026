@@ -76,6 +76,16 @@ impl Modulation {
         self.points.sort_by(|a, b| a.at.total_cmp(&b.at));
     }
 
+    /// The value `seconds` in, when played `times` times and then held.
+    pub fn value_after(&self, seconds: f64, times: usize) -> f64 {
+        let passes = seconds / self.length;
+        if passes >= times as f64 {
+            self.value_at(1.0)
+        } else {
+            self.value_at(passes.fract())
+        }
+    }
+
     /// The value at `fraction` (0..1) of the length.
     pub fn value_at(&self, fraction: f64) -> f64 {
         let points = &self.points;

@@ -1,32 +1,98 @@
 //! A running audio engine plus the evaluator that feeds it: the one object a
 //! frontend (REPL, editor app, ...) needs to hold on to.
+//!
+//! Three threads share the work: the caller's (evaluating code), the audio
+//! thread (rendering), and a scheduler thread that sends the notes of running
+//! patterns a little ahead of time (see `scheduler`).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 use rtrb::Producer;
 
-use crate::engine::{Command, Engine, MAX_BLOCK, Status};
-use crate::eval::Evaluator;
+use crate::engine::{Command, Engine, MAX_BLOCK, Slot, Status};
+use crate::eval::{Action, Evaluator};
 use crate::lang;
 use crate::nodes::{Frame, Node};
 use crate::recorder::Recording;
 use crate::resource::Resources;
+use crate::scheduler::{self, Scheduler};
 
 pub struct Session {
     pub device_name: String,
     pub sample_rate: u32,
     pub channels: u16,
-    commands: Producer<Command>,
+    shared: Arc<Mutex<Shared>>,
     status: Arc<Status>,
     evaluator: Evaluator,
-    sent: u64,
     recording: Option<Recording>,
     _output: Output,
+}
+
+/// What the caller's thread and the scheduler thread both use. Neither holds
+/// the lock for long, and the audio thread never takes it.
+struct Shared {
+    commands: Producer<Command>,
+    scheduler: Scheduler,
+    /// Commands sent so far.
+    sent: u64,
+}
+
+impl Shared {
+    fn new(commands: Producer<Command>, sample_rate: u32) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            commands,
+            scheduler: Scheduler::new(sample_rate),
+            sent: 0,
+        }))
+    }
+
+    /// Where something started now starts: its beat and frame, and its slot.
+    /// In a named slot, whatever played there stops at that moment.
+    fn start(&mut self, now: u64, slot: Option<String>) -> (f64, u64, Slot) {
+        let beat = self.scheduler.start_beat(now);
+        let at = self.scheduler.clock.frame_at(beat);
+        let slot = self.scheduler.slot(slot.as_deref());
+        if slot != 0 {
+            self.scheduler.end_slot(slot, beat);
+            self.send(Command::StopSlot { slot, at });
+        }
+        (beat, at, slot)
+    }
+
+    fn send(&mut self, cmd: Command) {
+        // The queue only fills up if the audio thread has stalled; dropping the
+        // command is better than blocking.
+        if self.commands.push(cmd).is_ok() {
+            self.sent += 1;
+        }
+    }
+}
+
+/// Every `TICK`, send the notes that are coming up. Ends with the session.
+fn run_scheduler(shared: Weak<Mutex<Shared>>, status: Arc<Status>, sample_rate: u32) {
+    let lookahead = (scheduler::LOOKAHEAD_SECONDS * sample_rate as f64) as u64;
+    loop {
+        std::thread::sleep(scheduler::TICK);
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        let Ok(mut shared) = shared.lock() else {
+            return;
+        };
+        let now = status.frames.load(Ordering::Relaxed);
+        for event in shared.scheduler.due(now + lookahead) {
+            shared.send(Command::Play {
+                node: event.node,
+                at: Some(event.at),
+                slot: event.slot,
+            });
+        }
+    }
 }
 
 // The fields are only held, never read.
@@ -52,7 +118,7 @@ impl Session {
 
         // Two lock-free single-producer/single-consumer queues: commands go to the
         // audio thread, finished nodes come back to be freed.
-        let (commands, commands_rx) = rtrb::RingBuffer::<Command>::new(256);
+        let (commands, commands_rx) = rtrb::RingBuffer::<Command>::new(1024);
         let (garbage_tx, mut garbage) = rtrb::RingBuffer::<Box<dyn Node>>::new(1024);
         let status = Arc::new(Status::default());
         let engine = Engine::new(commands_rx, garbage_tx, status.clone(), config.sample_rate);
@@ -75,23 +141,27 @@ impl Session {
             }
         });
 
+        let shared = Shared::new(commands, config.sample_rate);
+        let (weak, scheduler_status) = (Arc::downgrade(&shared), status.clone());
+        std::thread::spawn(move || run_scheduler(weak, scheduler_status, config.sample_rate));
+
         Ok(Self {
             device_name,
             sample_rate: config.sample_rate,
             channels: config.channels,
-            commands,
+            shared,
             status,
             evaluator: Evaluator::new(config.sample_rate, resources),
-            sent: 0,
             recording: None,
             _output: Output::Device(stream),
         })
     }
 
     /// A session that evaluates code but plays nothing, for tests. Commands are
-    /// queued but never consumed, so don't call `wait_until_idle` on it.
+    /// queued but never consumed, and patterns never advance, so don't call
+    /// `wait_until_idle` on it.
     pub fn without_output(sample_rate: u32, resources: Resources) -> Self {
-        let (commands, commands_rx) = rtrb::RingBuffer::<Command>::new(256);
+        let (commands, commands_rx) = rtrb::RingBuffer::<Command>::new(1024);
         let (garbage_tx, _) = rtrb::RingBuffer::<Box<dyn Node>>::new(1);
         let status = Arc::new(Status::default());
         let engine = Engine::new(commands_rx, garbage_tx, status.clone(), sample_rate);
@@ -99,22 +169,63 @@ impl Session {
             device_name: "no output".to_string(),
             sample_rate,
             channels: 2,
-            commands,
+            shared: Shared::new(commands, sample_rate),
             status,
             evaluator: Evaluator::new(sample_rate, resources),
-            sent: 0,
             recording: None,
             _output: Output::None(engine),
         }
     }
 
-    /// Parse and evaluate `src`, sending the resulting commands to the audio thread.
+    fn shared(&self) -> MutexGuard<'_, Shared> {
+        // The scheduler thread can't panic while holding the lock in any way
+        // that leaves the state broken, so a poisoned lock is still usable.
+        self.shared.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Parse and evaluate `src`, and carry out what it asks for. Sounds and
+    /// patterns start on the next bar; one played in a named slot replaces
+    /// what was playing there, at that same moment.
     pub fn eval(&mut self, src: &str) -> Result<(), lang::Error> {
         let program = lang::parse(src)?;
-        for cmd in self.evaluator.run(&program)? {
-            self.send(cmd);
+        let actions = self.evaluator.run(&program)?;
+        let now = self.status.frames.load(Ordering::Relaxed);
+        let sample_rate = self.sample_rate;
+        let mut shared = self.shared();
+        for action in actions {
+            match action {
+                Action::Bpm(bpm) => shared.scheduler.clock.set_bpm(bpm, now),
+                Action::StopAll => {
+                    shared.scheduler.clear();
+                    shared.send(Command::StopAll);
+                }
+                Action::Play { sound, slot } => {
+                    let (_, at, slot) = shared.start(now, slot);
+                    let node = sound.instantiate(sample_rate);
+                    shared.send(Command::Play {
+                        node,
+                        at: Some(at),
+                        slot,
+                    });
+                }
+                Action::Pattern {
+                    pattern,
+                    instrument,
+                    slot,
+                } => {
+                    let (beat, _, slot) = shared.start(now, slot);
+                    shared.scheduler.add(pattern, instrument, slot, beat);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// The tempo, and the current position in beats.
+    pub fn position(&self) -> (f64, f64) {
+        let now = self.status.frames.load(Ordering::Relaxed);
+        let clock = &self.shared().scheduler.clock;
+        (clock.bpm(), clock.beat_at(now))
     }
 
     /// Where the code's samples, envelopes, ... are.
@@ -122,9 +233,11 @@ impl Session {
         self.evaluator.resources()
     }
 
-    /// Fade out everything that's playing.
+    /// Fade out everything that's playing, and stop all patterns.
     pub fn stop_all(&mut self) {
-        self.send(Command::StopAll);
+        let mut shared = self.shared();
+        shared.scheduler.clear();
+        shared.send(Command::StopAll);
     }
 
     /// Number of voices currently playing.
@@ -135,8 +248,16 @@ impl Session {
     /// Block until every command sent so far has been picked up and all voices
     /// have finished.
     pub fn wait_until_idle(&self) {
-        while self.status.commands_received.load(Ordering::Acquire) < self.sent || self.voices() > 0
-        {
+        loop {
+            // (One lock at a time: the guard must be gone before taking it again.)
+            let (sent, patterns) = {
+                let shared = self.shared();
+                (shared.sent, shared.scheduler.patterns())
+            };
+            let received = self.status.commands_received.load(Ordering::Acquire);
+            if received >= sent && self.voices() == 0 && patterns == 0 {
+                return;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -166,11 +287,7 @@ impl Session {
     }
 
     fn send(&mut self, cmd: Command) {
-        // The queue only fills up if the audio thread has stalled; dropping the
-        // command is better than blocking the UI.
-        if self.commands.push(cmd).is_ok() {
-            self.sent += 1;
-        }
+        self.shared().send(cmd);
     }
 }
 
@@ -224,4 +341,77 @@ where
         |err| eprintln!("audio stream error: {err}"),
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eval_drives_the_clock_and_patterns() {
+        let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples");
+        let resources = Resources {
+            root: samples.clone(),
+            sample_dirs: vec![samples],
+        };
+        let mut session = Session::without_output(48_000, resources);
+        assert_eq!(session.position(), (120.0, 0.0));
+        session.eval("140.bpm").unwrap();
+        assert_eq!(session.position().0, 140.0);
+        let drums = r#"notes("x . x x", 0.25b).play(sample("kick.mp3"), "drums")"#;
+        session.eval(drums).unwrap();
+        session.eval(drums).unwrap();
+        // The first one is told to end where the second starts; it's dropped
+        // once the scheduler gets there.
+        assert_eq!(session.shared().scheduler.patterns(), 2);
+        session.shared().scheduler.due(10 * 48_000);
+        assert_eq!(session.shared().scheduler.patterns(), 1);
+        session.stop_all();
+        assert_eq!(session.shared().scheduler.patterns(), 0);
+    }
+
+    /// The whole path, without a device: evaluate a pattern, then alternate
+    /// the scheduler's work with rendering blocks, as the two threads would.
+    #[test]
+    fn pattern_hits_land_on_their_frames() {
+        let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples");
+        let resources = Resources {
+            root: samples.clone(),
+            sample_dirs: vec![samples],
+        };
+        let mut session = Session::without_output(48_000, resources);
+        // A hit every beat (24000 frames at 120 bpm), from the first bar line
+        // after the lookahead: beat 4.
+        session
+            .eval(r#"notes("x", 1b).play(sample("kick.mp3").fit(10ms))"#)
+            .unwrap();
+        let Output::None(engine) = &mut session._output else {
+            unreachable!()
+        };
+        let lookahead = (scheduler::LOOKAHEAD_SECONDS * 48_000.0) as u64;
+        let mut out = Vec::new();
+        let mut block = vec![[0.0; 2]; 480];
+        while out.len() < 200_000 {
+            let now = session.status.frames.load(Ordering::Relaxed);
+            let mut shared = session.shared.lock().unwrap();
+            for event in shared.scheduler.due(now + lookahead) {
+                shared.send(Command::Play {
+                    node: event.node,
+                    at: Some(event.at),
+                    slot: event.slot,
+                });
+            }
+            drop(shared);
+            engine.process(&mut block);
+            out.extend(block.iter().map(|f| f[0].abs()));
+        }
+        let onsets: Vec<usize> = (1..out.len())
+            .filter(|&i| {
+                out[i] > 0.0
+                    && out[i - 1] == 0.0
+                    && out[i - 480.min(i)..i].iter().all(|s| *s == 0.0)
+            })
+            .collect();
+        assert_eq!(onsets, [96_000, 120_000, 144_000, 168_000, 192_000]);
+    }
 }
