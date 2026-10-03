@@ -1,0 +1,10 @@
+{
+  "length": 0.18,
+  "points": [
+    { "at": 0.0, "value": 0.5, "curve": -0.3 },
+    { "at": 0.25, "value": 1.0, "curve": 0.3 },
+    { "at": 0.5, "value": 0.5, "curve": -0.3 },
+    { "at": 0.75, "value": 0.0, "curve": 0.3 },
+    { "at": 1.0, "value": 0.5, "curve": 0.0 }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "attack": { "time": 0.002, "curve": 0.0 },
+  "decay": { "time": 1.4, "curve": -0.7 },
+  "sustain": 0.0,
+  "release": { "time": 0.25, "curve": -0.5 }
+}

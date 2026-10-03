@@ -1,0 +1,114 @@
+-- American folk, 100 bpm, in G. Open with: cargo run -p rocktober -- folk.rock
+--
+-- cmd-shift-enter plays the whole band: everything starts together on the
+-- next bar and loops every 8 bars (G C G D G C D G). Or start with the guitar
+-- and add parts one by one with cmd-enter; cmd-. takes a part out again.
+--
+-- The strings are wavetables with a plucked envelope and a brightness that
+-- dies away (the "dampen" modulation, restarted on every note). The rhythm is
+-- a stomp, claps and a shaker made from bits of the recordings, and Auke sings.
+
+100.bpm
+
+
+-- Guitar: Travis picking. The thumb alternates bass notes on the beats, the
+-- fingers pick the chord in between. 8th notes, one line per bar.
+
+let guitar = wavetable("bright", modulation("dampen").retrig * 0.55, 0.1, ?note).gain(0.7) * envelope("string") * 0.3
+notes("
+  g2 b3 d3 d4  g2 g4 d3 b3
+  c3 e4 g2 g4  c3 c4 g2 e4
+  g2 b3 d3 d4  g2 g4 d3 b3
+  d3 f#4 a2 a4  d3 d4 a2 f#4
+  g2 b3 d3 d4  g2 g4 d3 b3
+  c3 e4 g2 g4  c3 c4 g2 e4
+  d3 f#4 a2 a4  d3 d4 a2 f#4
+  g2 b3 d3 d4  g2 g4 d3 b3
+", 0.5b).play(guitar, "guitar")
+
+
+-- Upright bass: root and fifth, a little rounder than a sine.
+
+let upright = wavetable("basic", 0.2, 0, ?note) * envelope("upright") * 0.55
+notes("
+  g1 _ . .  d2 _ . .
+  c2 _ . .  g1 _ . .
+  g1 _ . .  d2 _ . .
+  d2 _ . .  a1 _ . .
+  g1 _ . .  d2 _ . .
+  c2 _ . .  g1 _ . .
+  d2 _ . .  a1 _ . .
+  g1 _ . .  d2 _ . .
+", 0.5b).play(upright, "bass")
+
+
+-- Banjo: a forward roll in 16ths over the chord, with the high G drone string.
+-- It sits out the first four bars and comes in on the fifth.
+
+let banjo = wavetable("pulse", modulation("dampen").retrig * 0.4 + 0.5, 0.25, ?note) * envelope("banjo") * 0.25
+notes("
+  . . . .  . . . .  . . . .  . . . .
+  . . . .  . . . .  . . . .  . . . .
+  . . . .  . . . .  . . . .  . . . .
+  . . . .  . . . .  . . . .  . . . .
+  b4 d5 g4 b4  d5 g4 b4 d5  b4 d5 g4 b4  d5 g4 b4 d5
+  c5 e5 g4 c5  e5 g4 c5 e5  c5 e5 g4 c5  e5 g4 c5 e5
+  a4 d5 g4 a4  d5 g4 a4 d5  a4 d5 g4 a4  d5 g4 a4 d5
+  b4 d5 g4 b4  d5 g4 b4 d5  b4 d5 g4 b4  d5 g4 b4 d5
+", 0.25b).play(banjo, "banjo")
+
+
+-- The tune, on something between a harmonica and a fiddle: a reedy wavetable
+-- with vibrato (a little under and over the note), slow to speak.
+
+let reed = wavetable("basic", 0.25, 0.05, ?note + -0.15 + modulation("vibrato").repeat(inf) * 0.3) * envelope("reed") * 0.22
+notes("
+  d4 _ g4 _  b4 _ a4 g4
+  e4 _ g4 _  _ _ . .
+  d4 _ b3 _  d4 _ g4 _
+  a4 _ _ _  f#4 _ d4 _
+  b4 _ d5 _  b4 _ a4 g4
+  e4 _ g4 _  e4 _ c4 _
+  d4 _ f#4 _  a4 _ c5 b4
+  g4 _ _ _  _ _ . .
+", 0.5b).play(reed, "tune")
+
+
+-- A pump organ underneath, one chord per bar, one pattern per voice.
+
+let organ = wavetable("sine-square", 0.12, 0, ?note) * envelope("organ") * 0.09
+notes("g3 g3 g3 f#3  g3 g3 f#3 g3", 4b).play(organ, "organ1")
+notes("b3 c4 b3 a3  b3 c4 a3 b3", 4b).play(organ, "organ2")
+notes("d4 e4 d4 d4  d4 e4 d4 d4", 4b).play(organ, "organ3")
+
+
+-- Boom-chick: a stomp on 1 and 3 (the kick, in a dark wooden room), claps on
+-- 2 and 4 (two short bits of dinner talk, layered), and a shaker in 16ths
+-- from a consonant.
+
+let stomp = sample("kick.mp3").fit(200ms).gain(-8db).reverb("dark_room", 0.3)
+notes("x . . .  . . . .  x . . .  . . . .", 0.25b).play(stomp, "stomp")
+
+let clap = add(
+  sample("recordings/2026-09-13 Pooja.m4a", 35:04:308, 35:04:558),
+  sample("recordings/2026-08-29 Big dinner.m4a", 13:55:047, 13:55:297),
+) * envelope("hit").gate(80ms)
+notes(". . . .  x . . .  . . . .  x . . .", 0.25b).play(clap.gain(-8db).reverb("small_room", 0.3), "clap")
+
+let shaker = sample("recordings/2026-07-23 Spanish speaking train conductor 1.m4a", 0:07:362, 0:07:482) * envelope("hit").gate(30ms)
+notes("x . x x  x . x x  x . x x  x . x x", 0.25b).play(shaker.gain(-16db), "shaker")
+
+
+-- Auke sings, in the first half of the loop; a good wish from him in the
+-- second. (They weren't sung in G, so they float over the band a bit.)
+
+let song = sample("recordings/2026-05-17 Auke lied.m4a", 0:13:000, 0:21:000).reverb("plate", 0.3)
+notes("x .", 16b).play(song, "song")
+let wish = sample("recordings/2026-05-18 Auke goede wens.m4a", 0:21:737, 0:26:000).reverb("plate", 0.3)
+notes(". x", 16b).play(wish, "wish")
+
+
+-- The back porch: a dinner party murmuring along, far away.
+
+let porch = sample("recordings/2026-08-29 Big dinner.m4a", 8:00:000, 8:19:200).reverb("hall", 0.4)
+notes("x", 32b).play(porch.gain(-6db), "porch")
