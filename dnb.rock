@@ -1,0 +1,84 @@
+-- Drum'n'bass, 174 bpm, in F minor. Open with: cargo run -p rocktober -- dnb.rock
+--
+-- cmd-shift-enter plays everything: it all starts together on the next bar,
+-- and the parts loop in step (drums every bar, the rest every 8 bars). Or start
+-- with the drums and bring parts in one by one with cmd-enter; cmd-. on a
+-- block takes that part out again (on the next bar).
+--
+-- No breakbeat here: the drums are the kick plus little bits of the recordings
+-- (a bark for the snare, consonants for the hats). Tweak the gains to taste.
+
+174.bpm
+
+
+-- Drums. Two-step: kick on 1 and on the "and" of 3, snare on 2 and 4, ghost
+-- snares and two layers of hats around them. One bar, in 16ths.
+
+let kick = sample("kick.mp3").fit(250ms).gain(-4db)
+notes("x . . .  . . . .  . . x .  . . . .", 0.25b).play(kick, "kick")
+
+let snare = add(
+  sample("recordings/2026-08-31 Airplane bark.m4a", 0:04:707, 0:04:957),
+  sample("recordings/2026-08-31 Airplane.m4a", 0:02:895, 0:03:295).gain(-6db),
+) * envelope("hit").gate(180ms)
+notes(". . . .  x . . .  . . . .  x . . .", 0.25b).play(snare.reverb("small_room", 0.25), "snare")
+notes(". . . .  . . . x  . x . .  . . . x", 0.25b).play(snare.gain(-12db), "ghosts")
+
+let hat = sample("recordings/2026-07-23 Spanish speaking train conductor 1.m4a", 0:07:362, 0:07:482) * envelope("hit").gate(40ms)
+notes(". . x .  . . x .  . . x .  . . x x", 0.25b).play(hat.gain(-6db), "hats")
+let tick = sample("recordings/2026-10-02 Silje 5.m4a", 0:39:592, 0:39:712) * envelope("hit").gate(25ms)
+notes("x x . x  x x . x  x x . x  x . x x", 0.25b).play(tick.gain(-8db), "ticks")
+
+
+-- Bass: a reese (two saws, a hair apart, growling through the warp) an octave
+-- above a plain sine sub, both playing the same line, two bars per chord. Both
+-- duck out of the kick's way: "duck" is a one-bar modulation with a dip where
+-- each kick is, and since modulations run on from the start of the pattern, the
+-- dips stay on the kicks.
+
+let bassline = notes("
+  f1 _ _ .  . f1 . .  f1 _ . f1  . . f2 .
+  db2 _ _ .  . db2 . .  db2 _ . db2  . . db3 .
+  bb1 _ _ .  . bb1 . .  bb1 _ . bb1  . . bb2 .
+  c2 _ _ .  . c2 . .  c2 _ . c2  . . c3 .
+", 0.5b)
+let growl = modulation("growl").repeat(inf) * 0.5
+let duck = modulation("duck").repeat(inf)
+let reese = add(
+  wavetable("sine-saw", 1, growl, ?note + 12),
+  wavetable("sine-saw", 1, growl, ?note + 12.15),
+) * envelope("reese") * duck * 0.3
+bassline.play(reese, "reese")
+let sub = wavetable("basic", 0, 0, ?note) * envelope("sub") * duck * 0.5
+bassline.play(sub, "sub")
+
+
+-- Pads: Fm, Db, Bbm, C, two bars each, one pattern per voice. The position
+-- drifts slowly through the "rise" modulation, latched per chord.
+
+let pad = wavetable("bright", modulation("rise").repeat(inf).latch * 0.6, 0.1, ?note) * envelope("pad") * 0.2
+notes("f3 db3 bb2 c3", 8b).play(pad, "pad1")
+notes("ab3 f3 db3 e3", 8b).play(pad, "pad2")
+notes("c4 ab3 f3 g3", 8b).play(pad, "pad3")
+
+
+-- Vocals: Silje singing, a phrase every four bars in a big hall, and a
+-- stuttered chop of it on the last beat of every eighth bar.
+
+let phrase = sample("recordings/2026-10-02 Silje 3.m4a", 0:08:250, 0:11:250).gain(6db)
+notes("x . . .", 4b).play(phrase.reverb("hall", 0.45), "vocal")
+
+let chop = sample("recordings/2026-10-02 Silje 3.m4a", 0:13:500, 0:13:800).gain(6db) * envelope("hit").gate(120ms)
+let stutter = seq(chop.fit(0.25b), chop.fit(0.125b).repeat(2), chop.fit(0.0625b).repeat(8))
+notes(". . . .  . . . .  . . . .  . . . .  . . . .  . . . .  . . . .  . . . x", 1b)
+  .play(stutter.reverb("plate", 0.3), "stutter")
+
+
+-- Atmosphere: the gong on every eighth downbeat, and an airplane drifting by
+-- underneath, pumped by the growl.
+
+let gong = sample("recordings/2026-09-25 Gong sound 2.m4a", 0:08:672, 0:11:000).reverb("cathedral", 0.8)
+notes("x", 32b).play(gong, "gong")
+
+let plane = sample("recordings/2026-08-31 Airplane.m4a", 0:04:000, 0:15:000) * modulation("growl").repeat(inf)
+notes("x", 32b).play(plane.reverb("cathedral", 0.7).gain(-4db), "plane")
