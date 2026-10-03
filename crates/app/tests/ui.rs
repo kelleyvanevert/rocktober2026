@@ -22,6 +22,7 @@ mod macos {
     use rocktober_engine::Session;
     use rocktober_engine::envelope::Envelope;
     use rocktober_engine::modulation::Modulation;
+    use rocktober_engine::resource::Resources;
 
     struct Harness {
         // Fields drop in order: the entity handle must go before the app context,
@@ -53,7 +54,11 @@ mod macos {
 
             // A path that doesn't exist, so the workspace starts with its example code.
             let path = out.join("untitled.rock");
-            let session = Session::without_output(48_000, vec![root.join("samples")]);
+            let resources = Resources {
+                root: out.clone(),
+                sample_dirs: vec![root.join("samples")],
+            };
+            let session = Session::without_output(48_000, resources);
             let (window, workspace) = cx
                 .update(|cx| {
                     let options = WindowOptions {

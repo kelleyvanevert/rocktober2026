@@ -11,6 +11,13 @@
 //! sample("kick.mp3").fit(500ms).repeat(4).play
 //! ```
 //!
+//! `a * b` is shorthand for `mul(a, b)` and `a + b` for `add(a, b)`. Method
+//! calls bind tightest, then `*`, then `+`; parentheses group:
+//!
+//! ```text
+//! (sample("kick.mp3") * envelope("pluck").gate(100ms)).play
+//! ```
+//!
 //! The parser knows nothing about what `play` or `fit` mean; it just builds a tree.
 //! Giving the tree meaning is `eval`'s job.
 
@@ -64,6 +71,8 @@ pub(crate) enum Token {
     RParen,
     Comma,
     Dot,
+    Star,
+    Plus,
 }
 
 /// Whether a '.' or '-' at `i` begins (or continues) a number rather than being
@@ -102,11 +111,13 @@ pub(crate) fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                     i += 1;
                 }
             }
-            b'(' | b')' | b',' | b'.' if !starts_number(bytes, i) => {
+            b'(' | b')' | b',' | b'.' | b'*' | b'+' if !starts_number(bytes, i) => {
                 let tok = match c {
                     b'(' => Token::LParen,
                     b')' => Token::RParen,
                     b',' => Token::Comma,
+                    b'*' => Token::Star,
+                    b'+' => Token::Plus,
                     _ => Token::Dot,
                 };
                 tokens.push((tok, start));
@@ -208,8 +219,41 @@ impl Parser {
         }
     }
 
-    /// A primary expression followed by any number of `.method` calls.
+    /// Terms joined by `+`, left to right.
     fn expr(&mut self) -> Result<Spanned, Error> {
+        self.binary(Token::Plus, "add", Self::term)
+    }
+
+    /// Method chains joined by `*`, left to right.
+    fn term(&mut self) -> Result<Spanned, Error> {
+        self.binary(Token::Star, "mul", Self::chain)
+    }
+
+    /// `operand (op operand)*`, as nested calls of `function`.
+    fn binary(
+        &mut self,
+        op: Token,
+        function: &str,
+        operand: fn(&mut Self) -> Result<Spanned, Error>,
+    ) -> Result<Spanned, Error> {
+        let mut expr = operand(self)?;
+        while self.peek() == Some(&op) {
+            let pos = self.pos();
+            self.i += 1;
+            let rhs = operand(self)?;
+            expr = Spanned {
+                expr: Expr::Call {
+                    name: function.to_string(),
+                    args: vec![expr, rhs],
+                },
+                pos,
+            };
+        }
+        Ok(expr)
+    }
+
+    /// A primary expression followed by any number of `.method` calls.
+    fn chain(&mut self) -> Result<Spanned, Error> {
         let mut expr = self.primary()?;
         while self.peek() == Some(&Token::Dot) {
             self.i += 1;
@@ -240,6 +284,11 @@ impl Parser {
             Token::Str(s) => Expr::Str(s),
             Token::Num(n) => Expr::Num(n),
             Token::Duration(d) => Expr::Duration(d),
+            Token::LParen => {
+                let inner = self.expr()?;
+                self.expect(Token::RParen, "')'")?;
+                return Ok(inner);
+            }
             Token::Ident(name) => {
                 if self.peek() != Some(&Token::LParen) {
                     return err(self.pos(), format!("expected '(' after '{name}'"));
@@ -379,6 +428,22 @@ mod tests {
         assert_eq!(times, [11.188, 62.0, 30.5, 600.005]);
         assert!(parse("f(1:2:3:4)").is_err());
         assert!(parse("f(-1:00)").is_err());
+    }
+
+    #[test]
+    fn operators_desugar_with_precedence() {
+        assert_eq!(
+            desugar("a() * b() + c() * d()"),
+            "add(mul(a(), b()), mul(c(), d()))"
+        );
+        assert_eq!(desugar("a() * b() * c()"), "mul(mul(a(), b()), c())");
+        assert_eq!(desugar("a() * b().f(1)"), "mul(a(), f(b(), 1))");
+        assert_eq!(desugar("(a() * b()).f"), "f(mul(a(), b()))");
+        assert_eq!(desugar("2*-0.5+1"), "add(mul(2, -0.5), 1)");
+        assert_eq!(desugar("f((1 + 2), 3)"), "f(add(1, 2), 3)");
+        assert!(parse("a() *").is_err());
+        assert!(parse("(a()").is_err());
+        assert_eq!(parse("a() * * b()").unwrap_err().pos, 6);
     }
 
     #[test]

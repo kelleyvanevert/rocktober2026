@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use gpui_kit::*;
-use rocktober::workspace::{Workspace, sample_dirs};
+use rocktober::workspace::Workspace;
 use rocktober_engine::Session;
+use rocktober_engine::resource::Resources;
 
 fn main() {
     let path = std::env::args()
@@ -16,7 +17,7 @@ fn main() {
             rocktober::init(cx);
             cx.on_window_closed(|cx, _| cx.quit()).detach();
 
-            let session = Session::start(sample_dirs(&path));
+            let session = Session::start(Resources::for_code(&path));
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,

@@ -68,6 +68,32 @@ impl ResourceKind {
     }
 }
 
+/// Where a program's resources are.
+#[derive(Clone, Debug)]
+pub struct Resources {
+    /// The folder of the code file, which has `envelopes/`, `modulations/`, ...
+    pub root: PathBuf,
+    /// Where `sample("...")` looks for files, in order.
+    pub sample_dirs: Vec<PathBuf>,
+}
+
+impl Resources {
+    /// For the code file at `path`. Samples are looked for next to it, then in
+    /// the working directory, each with and without a `samples/` subfolder.
+    pub fn for_code(path: &Path) -> Self {
+        let mut sample_dirs = vec![PathBuf::from("."), PathBuf::from("samples")];
+        let root = match path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            Some(dir) => {
+                sample_dirs.insert(0, dir.join("samples"));
+                sample_dirs.insert(0, dir.to_path_buf());
+                dir.to_path_buf()
+            }
+            None => PathBuf::from("."),
+        };
+        Self { root, sample_dirs }
+    }
+}
+
 /// The first of `dirs` that has a file called `name`.
 pub fn find(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
     dirs.iter().map(|dir| dir.join(name)).find(|p| p.is_file())

@@ -1,7 +1,7 @@
 //! The main window: code editor, console, status bar.
 
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui_kit::component::input::{
@@ -12,7 +12,7 @@ use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rocktober_engine::Session;
-use rocktober_engine::resource::{self, ResourceKind, ResourceRef};
+use rocktober_engine::resource::{self, ResourceKind, ResourceRef, Resources};
 
 use crate::envelope_editor::EnvelopeEditor;
 use crate::modulation_editor::ModulationEditor;
@@ -93,17 +93,6 @@ pub struct Workspace {
     log: Vec<LogEntry>,
     log_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
-}
-
-/// Where `sample("...")` looks for files: next to the code file, then the
-/// working directory, each with and without a `samples/` subfolder.
-pub fn sample_dirs(path: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from("."), PathBuf::from("samples")];
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        dirs.insert(0, dir.join("samples"));
-        dirs.insert(0, dir.to_path_buf());
-    }
-    dirs
 }
 
 impl Workspace {
@@ -259,12 +248,17 @@ impl Workspace {
         }
     }
 
+    /// Where the code's samples, envelopes, ... are.
+    fn resources(&self) -> Resources {
+        match &self.session {
+            Some(session) => session.resources().clone(),
+            None => Resources::for_code(&self.path),
+        }
+    }
+
     /// The folder of the code file, where its resources live.
     fn code_dir(&self) -> PathBuf {
-        match self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            Some(dir) => dir.to_path_buf(),
-            None => PathBuf::from("."),
-        }
+        self.resources().root
     }
 
     /// The console contents, oldest first.
@@ -458,10 +452,7 @@ impl Workspace {
         let name = reference.name.clone();
         let (view, subscription) = match reference.kind {
             ResourceKind::Sample => {
-                let dirs = match &self.session {
-                    Some(session) => session.sample_dirs().to_vec(),
-                    None => sample_dirs(&self.path),
-                };
+                let dirs = self.resources().sample_dirs;
                 let cache = self.overviews.clone();
                 let times = reference.times.clone();
                 let editor = cx.new(|cx| SampleEditor::new(&name, times, &dirs, &root, cache, cx));

@@ -3,17 +3,31 @@
 //! Evaluation produces `Sound` values: cheap, immutable *descriptions* of sounds.
 //! Only `play` turns a description into a live, stateful node graph. Keeping those
 //! two apart means a description can be stored, reused or played many times at
-//! once, each play getting its own fresh playback state.
+//! once, each play getting its own fresh playback state. `Control` is the same for
+//! control signals (envelopes, modulations).
+//!
+//! Every value has one nominal `Type`, and a few convert implicitly where that's
+//! lossless and obvious: a number is a constant control, and an envelope is a
+//! control that's never released. Functions are declared as signatures (see
+//! `builtins`); a name can have several, and a call runs the first whose
+//! parameter types the arguments fit. Errors are generated from the
+//! signatures, so they say what was expected where.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
+use crate::control::{self, Combine, ControlNode, EnvelopePlayer, ModulationPlayer, Param};
 use crate::engine::Command;
+use crate::envelope::Envelope;
 use crate::lang::{Error, Expr, Spanned};
-use crate::nodes::{Add, Delay, Fit, Gain, Limit, Node, Repeat, SampleData, Sampler, Seq, Slice};
+use crate::modulation::Modulation;
+use crate::nodes::{
+    Add, Delay, Fit, Gain, Limit, Multiply, Node, Repeat, SampleData, Sampler, Seq, Slice,
+};
+use crate::resource::{self, ResourceKind, Resources};
 use crate::reverb::{self, Impulse, MAX_IR_SECONDS, Reverb};
-use crate::{resource, sample};
+use crate::sample;
 
 /// Fade-out applied where `fit` cuts a sound off. A few ms is enough to remove the
 /// click without audibly softening a transient.
@@ -38,7 +52,9 @@ pub enum Sound {
     Repeat(Box<Sound>, usize),
     Add(Vec<Sound>),
     Seq(Vec<Sound>),
-    Gain(f64, Box<Sound>),
+    Gain(Control, Box<Sound>),
+    /// Two sounds multiplied (ring modulation).
+    Multiply(Box<Sound>, Box<Sound>),
     Limit(f64, Box<Sound>),
     /// Impulse response and wet/dry mix.
     Reverb(Box<Sound>, Arc<Impulse>, f64),
@@ -78,9 +94,14 @@ impl Sound {
                     .map(|c| c.instantiate(sample_rate))
                     .collect(),
             )),
-            Sound::Gain(amount, child) => {
-                Box::new(Gain::new(*amount as f32, child.instantiate(sample_rate)))
-            }
+            Sound::Gain(amount, child) => Box::new(Gain::new(
+                amount.param(sample_rate),
+                child.instantiate(sample_rate),
+            )),
+            Sound::Multiply(a, b) => Box::new(Multiply::new(
+                a.instantiate(sample_rate),
+                b.instantiate(sample_rate),
+            )),
             Sound::Reverb(child, impulse, mix) => Box::new(Reverb::new(
                 child.instantiate(sample_rate),
                 impulse.clone(),
@@ -96,8 +117,81 @@ impl Sound {
     }
 }
 
+/// A description of a control signal, the counterpart of `Sound`.
+#[derive(Clone)]
+pub enum Control {
+    Constant(f64),
+    /// Played this many times, then held at its last value.
+    Modulation(Arc<Modulation>, usize),
+    /// Released after the gate (in seconds), if it has one.
+    Envelope(Arc<Envelope>, Option<f64>),
+    Mul(Box<Control>, Box<Control>),
+    Add(Box<Control>, Box<Control>),
+}
+
+impl Control {
+    pub fn instantiate(&self, sample_rate: u32) -> Box<dyn ControlNode> {
+        match self {
+            Control::Constant(v) => Box::new(control::Constant(*v as f32)),
+            Control::Modulation(data, times) => {
+                Box::new(ModulationPlayer::new(data.clone(), *times, sample_rate))
+            }
+            Control::Envelope(env, gate) => {
+                let gate = gate.map(|seconds| (seconds * sample_rate as f64).round() as usize);
+                Box::new(EnvelopePlayer::new(env.clone(), gate, sample_rate))
+            }
+            Control::Mul(a, b) => Box::new(Combine::new(
+                a.instantiate(sample_rate),
+                b.instantiate(sample_rate),
+                |a, b| a * b,
+            )),
+            Control::Add(a, b) => Box::new(Combine::new(
+                a.instantiate(sample_rate),
+                b.instantiate(sample_rate),
+                |a, b| a + b,
+            )),
+        }
+    }
+
+    /// As a parameter of an audio node: constants stay plain numbers.
+    fn param(&self, sample_rate: u32) -> Param {
+        match self {
+            Control::Constant(v) => Param::Const(*v as f32),
+            other => Param::signal(other.instantiate(sample_rate)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Type {
+    Sound,
+    Control,
+    Envelope,
+    Number,
+    Duration,
+    String,
+    Nothing,
+}
+
+impl Type {
+    fn name(self) -> &'static str {
+        match self {
+            Type::Sound => "a sound",
+            Type::Control => "a control",
+            Type::Envelope => "an envelope",
+            Type::Number => "a number",
+            Type::Duration => "a duration",
+            Type::String => "a string",
+            Type::Nothing => "nothing",
+        }
+    }
+}
+
+#[derive(Clone)]
 enum Value {
     Sound(Sound),
+    Control(Control),
+    Envelope(Arc<Envelope>),
     Str(String),
     Num(f64),
     Duration(f64),
@@ -105,15 +199,377 @@ enum Value {
 }
 
 impl Value {
-    fn type_name(&self) -> &'static str {
+    fn ty(&self) -> Type {
         match self {
-            Value::Sound(_) => "a sound",
-            Value::Str(_) => "a string",
-            Value::Num(_) => "a number",
-            Value::Duration(_) => "a duration",
-            Value::Nothing => "nothing",
+            Value::Sound(_) => Type::Sound,
+            Value::Control(_) => Type::Control,
+            Value::Envelope(_) => Type::Envelope,
+            Value::Str(_) => Type::String,
+            Value::Num(_) => Type::Number,
+            Value::Duration(_) => Type::Duration,
+            Value::Nothing => Type::Nothing,
         }
     }
+
+    /// Whether this value can be passed where `ty` is expected.
+    fn fits(&self, ty: Type) -> bool {
+        self.ty() == ty
+            || (ty == Type::Control && matches!(self, Value::Num(_) | Value::Envelope(_)))
+    }
+
+    // Accessors for arguments whose type a signature has already checked.
+
+    fn sound(&self) -> Sound {
+        match self {
+            Value::Sound(s) => s.clone(),
+            _ => unreachable!("not a sound"),
+        }
+    }
+
+    fn control(&self) -> Control {
+        match self {
+            Value::Control(c) => c.clone(),
+            Value::Num(n) => Control::Constant(*n),
+            Value::Envelope(env) => Control::Envelope(env.clone(), None),
+            _ => unreachable!("not a control"),
+        }
+    }
+
+    fn envelope(&self) -> Arc<Envelope> {
+        match self {
+            Value::Envelope(env) => env.clone(),
+            _ => unreachable!("not an envelope"),
+        }
+    }
+
+    fn num(&self) -> f64 {
+        match self {
+            Value::Num(n) => *n,
+            _ => unreachable!("not a number"),
+        }
+    }
+
+    fn duration(&self) -> f64 {
+        match self {
+            Value::Duration(d) => *d,
+            _ => unreachable!("not a duration"),
+        }
+    }
+
+    fn str(&self) -> &str {
+        match self {
+            Value::Str(s) => s,
+            _ => unreachable!("not a string"),
+        }
+    }
+}
+
+/// A parameter in a signature: its type, and what to call it in an error.
+#[derive(Clone, Copy)]
+struct P(Type, &'static str);
+
+const SOUND: P = P(Type::Sound, "a sound");
+const CONTROL: P = P(Type::Control, "a control");
+const NUMBER: P = P(Type::Number, "a number");
+const NAME: P = P(Type::String, "a file name");
+
+/// A built-in function signature.
+struct Builtin {
+    name: &'static str,
+    params: &'static [P],
+    /// How many of `params` must be given; the rest are optional.
+    required: usize,
+    /// Any number of further arguments like this.
+    rest: Option<P>,
+    run: fn(&mut Evaluator, &mut Call) -> Result<Value, Error>,
+}
+
+impl Builtin {
+    fn takes(&self, n: usize) -> bool {
+        n >= self.required && (n <= self.params.len() || self.rest.is_some())
+    }
+
+    fn param(&self, i: usize) -> P {
+        self.params.get(i).copied().or(self.rest).unwrap()
+    }
+
+    /// The first argument that doesn't fit, if any.
+    fn mismatch(&self, args: &[Value]) -> Option<usize> {
+        args.iter()
+            .enumerate()
+            .position(|(i, v)| !v.fits(self.param(i).0))
+    }
+
+    fn most_args(&self) -> usize {
+        if self.rest.is_some() {
+            usize::MAX
+        } else {
+            self.params.len()
+        }
+    }
+}
+
+/// The arguments of a call being run.
+struct Call<'a> {
+    name: &'static str,
+    args: Vec<Value>,
+    /// Each argument's position in the source.
+    positions: Vec<usize>,
+    /// The call's own position.
+    pos: usize,
+    commands: &'a mut Vec<Command>,
+}
+
+impl Call<'_> {
+    /// An error about argument `i`.
+    fn fail(&self, i: usize, msg: impl std::fmt::Display) -> Error {
+        Error {
+            pos: self.positions[i],
+            msg: format!("{}: {msg}", self.name),
+        }
+    }
+
+    /// An error about argument `i`, saying what was wanted instead.
+    fn wrong(&self, i: usize, want: &str) -> Error {
+        self.fail(
+            i,
+            format!("expected {want}, got {}", self.args[i].ty().name()),
+        )
+    }
+
+    fn sound(&self, i: usize) -> Sound {
+        self.args[i].sound()
+    }
+
+    fn control(&self, i: usize) -> Control {
+        self.args[i].control()
+    }
+}
+
+fn sound(s: Sound) -> Result<Value, Error> {
+    Ok(Value::Sound(s))
+}
+
+fn control(c: Control) -> Result<Value, Error> {
+    Ok(Value::Control(c))
+}
+
+fn builtin(
+    name: &'static str,
+    params: &'static [P],
+    required: usize,
+    run: fn(&mut Evaluator, &mut Call) -> Result<Value, Error>,
+) -> Builtin {
+    Builtin {
+        name,
+        params,
+        required,
+        rest: None,
+        run,
+    }
+}
+
+static BUILTINS: LazyLock<Vec<Builtin>> = LazyLock::new(builtins);
+
+/// Every built-in function. Where a name has several signatures, the first
+/// one that fits wins, so exact types come before ones that need converting.
+fn builtins() -> Vec<Builtin> {
+    const START: P = P(Type::Duration, "a start time (like 0:11:188)");
+    const END: P = P(Type::Duration, "an end time (like 0:12:625)");
+    const AMOUNT: P = P(Type::Control, "an amount (like 0.5, -6db or an envelope)");
+
+    vec![
+        builtin("play", &[SOUND], 1, |ev, c| {
+            let node = c.sound(0).instantiate(ev.sample_rate);
+            c.commands.push(Command::Play(node));
+            Ok(Value::Nothing)
+        }),
+        builtin("stop", &[], 0, |_, c| {
+            c.commands.push(Command::StopAll);
+            Ok(Value::Nothing)
+        }),
+        builtin("sample", &[NAME, START, END], 1, |ev, c| {
+            let start = c.args.get(1).map_or(0.0, Value::duration);
+            let end = c.args.get(2).map(Value::duration);
+            if end.is_some_and(|end| end <= start) {
+                return Err(c.wrong(2, "an end after the start"));
+            }
+            match ev.load(c.args[0].str(), start, end) {
+                Ok(data) => sound(Sound::Sample(data)),
+                Err(msg) => Err(Error { pos: c.pos, msg }),
+            }
+        }),
+        builtin(
+            "envelope",
+            &[P(Type::String, "an envelope name")],
+            1,
+            |ev, c| match ev.load_envelope(c.args[0].str()) {
+                Ok(env) => Ok(Value::Envelope(Arc::new(env))),
+                Err(msg) => Err(c.fail(0, msg)),
+            },
+        ),
+        builtin(
+            "modulation",
+            &[P(Type::String, "a modulation name")],
+            1,
+            |ev, c| match ev.load_modulation(c.args[0].str()) {
+                Ok(m) => control(Control::Modulation(Arc::new(m), 1)),
+                Err(msg) => Err(c.fail(0, msg)),
+            },
+        ),
+        builtin(
+            "gate",
+            &[
+                P(Type::Envelope, "an envelope"),
+                P(Type::Duration, "a duration (like 500ms)"),
+            ],
+            2,
+            |_, c| {
+                let env = c.args[0].envelope();
+                control(Control::Envelope(env, Some(c.args[1].duration())))
+            },
+        ),
+        builtin(
+            "fit",
+            &[SOUND, P(Type::Duration, "a duration (like 500ms)")],
+            2,
+            |_, c| sound(Sound::Fit(Box::new(c.sound(0)), c.args[1].duration())),
+        ),
+        builtin("slice", &[SOUND, START, END], 3, |_, c| {
+            let (start, end) = (c.args[1].duration(), c.args[2].duration());
+            if end <= start {
+                return Err(c.wrong(2, "an end after the start"));
+            }
+            sound(Sound::Slice(Box::new(c.sound(0)), start, end))
+        }),
+        builtin(
+            "delay",
+            &[SOUND, P(Type::Duration, "a duration (like 12s)")],
+            2,
+            |_, c| sound(Sound::Delay(Box::new(c.sound(0)), c.args[1].duration())),
+        ),
+        // `repeat(inf)` repeats forever (well, usize::MAX times).
+        builtin("repeat", &[SOUND, NUMBER], 2, |_, c| {
+            let times = repeat_count(c)?;
+            sound(Sound::Repeat(Box::new(c.sound(0)), times))
+        }),
+        builtin(
+            "repeat",
+            &[P(Type::Control, "a sound or a modulation"), NUMBER],
+            2,
+            |_, c| {
+                let times = repeat_count(c)?;
+                match c.control(0) {
+                    Control::Modulation(m, n) => {
+                        control(Control::Modulation(m, n.saturating_mul(times)))
+                    }
+                    _ => Err(c.wrong(0, "a sound or a modulation")),
+                }
+            },
+        ),
+        Builtin {
+            rest: Some(SOUND),
+            ..builtin("seq", &[], 0, |_, c| {
+                sound(Sound::Seq(c.args.iter().map(Value::sound).collect()))
+            })
+        },
+        // `a + b`
+        builtin("add", &[NUMBER, NUMBER], 2, |_, c| {
+            Ok(Value::Num(c.args[0].num() + c.args[1].num()))
+        }),
+        builtin("add", &[CONTROL, CONTROL], 2, |_, c| {
+            control(Control::Add(Box::new(c.control(0)), Box::new(c.control(1))))
+        }),
+        Builtin {
+            rest: Some(SOUND),
+            ..builtin("add", &[], 0, |_, c| {
+                sound(Sound::Add(c.args.iter().map(Value::sound).collect()))
+            })
+        },
+        // `a * b`
+        builtin("mul", &[NUMBER, NUMBER], 2, |_, c| {
+            Ok(Value::Num(c.args[0].num() * c.args[1].num()))
+        }),
+        builtin("mul", &[SOUND, SOUND], 2, |_, c| {
+            sound(Sound::Multiply(Box::new(c.sound(0)), Box::new(c.sound(1))))
+        }),
+        builtin("mul", &[SOUND, CONTROL], 2, |_, c| {
+            sound(Sound::Gain(c.control(1), Box::new(c.sound(0))))
+        }),
+        builtin("mul", &[CONTROL, SOUND], 2, |_, c| {
+            sound(Sound::Gain(c.control(0), Box::new(c.sound(1))))
+        }),
+        builtin("mul", &[CONTROL, CONTROL], 2, |_, c| {
+            control(Control::Mul(Box::new(c.control(0)), Box::new(c.control(1))))
+        }),
+        builtin("gain", &[SOUND, AMOUNT], 2, |_, c| {
+            sound(Sound::Gain(c.control(1), Box::new(c.sound(0))))
+        }),
+        builtin(
+            "limit",
+            &[
+                SOUND,
+                P(Type::Number, "a positive ceiling (like 0.9 or -1db)"),
+            ],
+            1,
+            |_, c| {
+                let ceiling = c.args.get(1).map_or(LIMIT_CEILING, Value::num);
+                if ceiling <= 0.0 {
+                    return Err(c.wrong(1, "a positive ceiling (like 0.9 or -1db)"));
+                }
+                sound(Sound::Limit(ceiling, Box::new(c.sound(0))))
+            },
+        ),
+        builtin(
+            "reverb",
+            &[
+                SOUND,
+                P(Type::String, "a space name"),
+                P(Type::Number, "a mix between 0 and 1"),
+            ],
+            2,
+            |ev, c| {
+                let name = c.args[1].str();
+                let Some(impulse) = ev.space(name) else {
+                    let names = reverb::preset_names().join(", ");
+                    return Err(c.fail(
+                        1,
+                        format!("unknown space \"{name}\" (try {names}, or a sound)"),
+                    ));
+                };
+                reverb_with(c, impulse)
+            },
+        ),
+        builtin(
+            "reverb",
+            &[SOUND, SOUND, P(Type::Number, "a mix between 0 and 1")],
+            2,
+            |ev, c| {
+                let impulse = Arc::new(Impulse::new(ev.render(&c.sound(1), MAX_IR_SECONDS)));
+                reverb_with(c, impulse)
+            },
+        ),
+    ]
+}
+
+fn repeat_count(c: &Call) -> Result<usize, Error> {
+    let n = c.args[1].num();
+    if n == f64::INFINITY {
+        Ok(usize::MAX)
+    } else if n >= 0.0 && n.fract() == 0.0 {
+        Ok(n as usize)
+    } else {
+        Err(c.wrong(1, "a whole number or inf"))
+    }
+}
+
+fn reverb_with(c: &Call, impulse: Arc<Impulse>) -> Result<Value, Error> {
+    let mix = match c.args.get(2) {
+        None => REVERB_MIX,
+        Some(Value::Num(m)) if (0.0..=1.0).contains(m) => *m,
+        Some(_) => return Err(c.wrong(2, "a mix between 0 and 1")),
+    };
+    sound(Sound::Reverb(Box::new(c.sound(0)), impulse, mix))
 }
 
 /// A decoded part of a file, as (start, end) seconds in `f64::to_bits` form so it
@@ -122,7 +578,7 @@ type Window = (u64, Option<u64>);
 
 pub struct Evaluator {
     sample_rate: u32,
-    sample_dirs: Vec<PathBuf>,
+    resources: Resources,
     /// Decoded samples, so each file is only loaded once. Holding an `Arc` here
     /// also guarantees the last reference to a sample is never dropped on the
     /// audio thread.
@@ -132,18 +588,17 @@ pub struct Evaluator {
 }
 
 impl Evaluator {
-    pub fn new(sample_rate: u32, sample_dirs: Vec<PathBuf>) -> Self {
+    pub fn new(sample_rate: u32, resources: Resources) -> Self {
         Self {
             sample_rate,
-            sample_dirs,
+            resources,
             cache: HashMap::new(),
             spaces: HashMap::new(),
         }
     }
 
-    /// Where `sample("...")` looks for files, in order.
-    pub fn sample_dirs(&self) -> &[PathBuf] {
-        &self.sample_dirs
+    pub fn resources(&self) -> &Resources {
+        &self.resources
     }
 
     /// Evaluate a program, returning the commands it wants sent to the audio thread.
@@ -165,173 +620,59 @@ impl Evaluator {
             Expr::Call { name, args } => (name.as_str(), args),
         };
 
+        let candidates: Vec<&Builtin> = BUILTINS.iter().filter(|b| b.name == name).collect();
+        if candidates.is_empty() {
+            return fail(format!("unknown function '{name}'"));
+        }
+
         let mut values = Vec::with_capacity(args.len());
         for arg in args {
             values.push(self.eval(arg, commands)?);
         }
 
-        let (min_args, max_args) = match name {
-            "stop" => (0, 0),
-            "play" => (1, 1),
-            "sample" => (1, 3),
-            "fit" | "repeat" | "gain" | "delay" => (2, 2),
-            "slice" => (3, 3),
-            "limit" => (1, 2),
-            "reverb" => (2, 3),
-            "add" | "seq" => (0, usize::MAX),
-            _ => return fail(format!("unknown function '{name}'")),
-        };
-        if values.len() < min_args || values.len() > max_args {
-            let expected = match (min_args, max_args) {
+        let n = values.len();
+        let fitting: Vec<&Builtin> = candidates.iter().copied().filter(|b| b.takes(n)).collect();
+        if fitting.is_empty() {
+            let least = candidates.iter().map(|b| b.required).min().unwrap();
+            let most = candidates.iter().map(|b| b.most_args()).max().unwrap();
+            let expected = match (least, most) {
                 (a, b) if a == b => format!("{a}"),
-                (a, b) => format!("{a} or {b}"),
+                (a, b) if b == a + 1 => format!("{a} or {b}"),
+                (a, usize::MAX) => format!("at least {a}"),
+                (a, b) => format!("{a} to {b}"),
             };
-            return fail(format!(
-                "{name} takes {expected} argument(s), got {}",
-                values.len()
-            ));
+            return fail(format!("{name} takes {expected} argument(s), got {n}"));
         }
 
-        let wrong = |v: &Value, want: &str, n: usize| {
-            Err(Error {
-                pos: args[n].pos,
-                msg: format!("{name}: expected {want}, got {}", v.type_name()),
-            })
+        let Some(found) = fitting.iter().find(|b| b.mismatch(&values).is_none()) else {
+            // Blame the argument that the closest signatures got stuck on.
+            let stuck = |b: &Builtin| b.mismatch(&values).unwrap();
+            let at = fitting.iter().map(|b| stuck(b)).max().unwrap();
+            let mut wanted: Vec<&str> = Vec::new();
+            for b in fitting.iter().filter(|b| stuck(b) == at) {
+                let hint = b.param(at).1;
+                if !wanted.contains(&hint) {
+                    wanted.push(hint);
+                }
+            }
+            return Err(Error {
+                pos: args[at].pos,
+                msg: format!(
+                    "{name}: expected {}, got {}",
+                    wanted.join(" or "),
+                    values[at].ty().name()
+                ),
+            });
         };
-        let sound = |s: Sound| Ok(Value::Sound(s));
 
-        match (name, values.as_slice()) {
-            ("sample", [Value::Str(path), rest @ ..]) => {
-                let start = match rest.first() {
-                    None => 0.0,
-                    Some(Value::Duration(d)) => *d,
-                    Some(v) => return wrong(v, "a start time (like 0:11:188)", 1),
-                };
-                let end = match rest.get(1) {
-                    None => None,
-                    Some(Value::Duration(d)) if *d > start => Some(*d),
-                    Some(Value::Duration(_)) => {
-                        return wrong(&rest[1], "an end after the start", 2);
-                    }
-                    Some(v) => return wrong(v, "an end time (like 0:12:625)", 2),
-                };
-                match self.load(path, start, end) {
-                    Ok(data) => sound(Sound::Sample(data)),
-                    Err(msg) => fail(msg),
-                }
-            }
-            ("sample", [v, ..]) => wrong(v, "a file name", 0),
-
-            ("fit", [Value::Sound(s), Value::Duration(d)]) => {
-                sound(Sound::Fit(Box::new(s.clone()), *d))
-            }
-            ("fit", [Value::Sound(_), v]) => wrong(v, "a duration (like 500ms)", 1),
-            ("fit", [v, _]) => wrong(v, "a sound", 0),
-
-            (
-                "slice",
-                [
-                    Value::Sound(s),
-                    Value::Duration(start),
-                    Value::Duration(end),
-                ],
-            ) => {
-                if end <= start {
-                    return wrong(&values[2], "an end after the start", 2);
-                }
-                sound(Sound::Slice(Box::new(s.clone()), *start, *end))
-            }
-            ("slice", [Value::Sound(_), Value::Duration(_), v]) => {
-                wrong(v, "an end time (like 0:12:625)", 2)
-            }
-            ("slice", [Value::Sound(_), v, _]) => wrong(v, "a start time (like 0:11:188)", 1),
-            ("slice", [v, ..]) => wrong(v, "a sound", 0),
-
-            // `repeat(inf)` repeats forever (well, usize::MAX times).
-            ("delay", [Value::Sound(s), Value::Duration(d)]) => {
-                sound(Sound::Delay(Box::new(s.clone()), *d))
-            }
-            ("delay", [Value::Sound(_), v]) => wrong(v, "a duration (like 12s)", 1),
-            ("delay", [v, _]) => wrong(v, "a sound", 0),
-
-            ("repeat", [Value::Sound(s), Value::Num(n)])
-                if *n == f64::INFINITY || (*n >= 0.0 && n.fract() == 0.0) =>
-            {
-                let times = if n.is_infinite() {
-                    usize::MAX
-                } else {
-                    *n as usize
-                };
-                sound(Sound::Repeat(Box::new(s.clone()), times))
-            }
-            ("repeat", [Value::Sound(_), v]) => wrong(v, "a whole number or inf", 1),
-            ("repeat", [v, _]) => wrong(v, "a sound", 0),
-
-            ("add" | "seq", _) => {
-                let mut children = Vec::with_capacity(values.len());
-                for (n, v) in values.iter().enumerate() {
-                    match v {
-                        Value::Sound(s) => children.push(s.clone()),
-                        v => return wrong(v, "a sound", n),
-                    }
-                }
-                sound(match name {
-                    "add" => Sound::Add(children),
-                    _ => Sound::Seq(children),
-                })
-            }
-
-            ("gain", [Value::Sound(s), Value::Num(amount)]) => {
-                sound(Sound::Gain(*amount, Box::new(s.clone())))
-            }
-            ("gain", [Value::Sound(_), v]) => wrong(v, "an amount (like 0.5 or -6db)", 1),
-            ("gain", [v, _]) => wrong(v, "a sound", 0),
-
-            ("limit", [Value::Sound(s)]) => sound(Sound::Limit(LIMIT_CEILING, Box::new(s.clone()))),
-            ("limit", [Value::Sound(s), Value::Num(ceiling)]) if *ceiling > 0.0 => {
-                sound(Sound::Limit(*ceiling, Box::new(s.clone())))
-            }
-            ("limit", [Value::Sound(_), v]) => wrong(v, "a positive ceiling (like 0.9 or -1db)", 1),
-            ("limit", [v, ..]) => wrong(v, "a sound", 0),
-
-            ("reverb", [Value::Sound(s), space, rest @ ..]) => {
-                let mix = match rest.first() {
-                    None => REVERB_MIX,
-                    Some(Value::Num(m)) if (0.0..=1.0).contains(m) => *m,
-                    Some(v) => return wrong(v, "a mix between 0 and 1", 2),
-                };
-                let impulse = match space {
-                    Value::Str(name) => match self.space(name) {
-                        Some(impulse) => impulse,
-                        None => {
-                            let names = reverb::preset_names().join(", ");
-                            return Err(Error {
-                                pos: args[1].pos,
-                                msg: format!(
-                                    "reverb: unknown space \"{name}\" (try {names}, or a sound)"
-                                ),
-                            });
-                        }
-                    },
-                    Value::Sound(ir) => Arc::new(Impulse::new(self.render(ir, MAX_IR_SECONDS))),
-                    v => return wrong(v, "a space name or a sound", 1),
-                };
-                sound(Sound::Reverb(Box::new(s.clone()), impulse, mix))
-            }
-            ("reverb", [v, ..]) => wrong(v, "a sound", 0),
-
-            ("play", [Value::Sound(s)]) => {
-                commands.push(Command::Play(s.instantiate(self.sample_rate)));
-                Ok(Value::Nothing)
-            }
-            ("play", [v]) => wrong(v, "a sound", 0),
-
-            ("stop", []) => {
-                commands.push(Command::StopAll);
-                Ok(Value::Nothing)
-            }
-            _ => unreachable!(),
-        }
+        let mut call = Call {
+            name: found.name,
+            args: values,
+            positions: args.iter().map(|a| a.pos).collect(),
+            pos: e.pos,
+            commands,
+        };
+        (found.run)(self, &mut call)
     }
 
     /// A preset space's impulse response, synthesized on first use.
@@ -369,8 +710,9 @@ impl Evaluator {
         start: f64,
         end: Option<f64>,
     ) -> Result<Arc<SampleData>, String> {
-        let path = resource::find(&self.sample_dirs, name)
-            .ok_or_else(|| format!("sample '{name}' not found in {:?}", self.sample_dirs))?;
+        let dirs = &self.resources.sample_dirs;
+        let path = resource::find(dirs, name)
+            .ok_or_else(|| format!("sample '{name}' not found in {dirs:?}"))?;
         let key = (path, (start.to_bits(), end.map(f64::to_bits)));
         if let Some(data) = self.cache.get(&key) {
             return Ok(data.clone());
@@ -379,45 +721,139 @@ impl Evaluator {
         self.cache.insert(key, data.clone());
         Ok(data)
     }
+
+    /// The path of an envelope or modulation file, if it exists. (These are
+    /// read fresh every time, so edits apply the next time the code runs.)
+    fn resource_path(&self, kind: ResourceKind, name: &str) -> Result<PathBuf, String> {
+        let path = kind.path(&self.resources.root, name);
+        if path.is_file() {
+            Ok(path)
+        } else {
+            Err(format!(
+                "\"{name}\" doesn't exist yet ({}/{}): put the cursor on it to create it",
+                kind.dir(),
+                kind.file_name(name)
+            ))
+        }
+    }
+
+    fn load_envelope(&self, name: &str) -> Result<Envelope, String> {
+        Envelope::load(&self.resource_path(ResourceKind::Envelope, name)?)
+    }
+
+    fn load_modulation(&self, name: &str) -> Result<Modulation, String> {
+        Modulation::load(&self.resource_path(ResourceKind::Modulation, name)?)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope::Stage;
     use crate::lang::parse;
+    use crate::modulation::Point;
     use crate::nodes::Frame;
 
+    fn samples() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples")
+    }
+
     fn evaluator() -> Evaluator {
-        let samples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples");
-        Evaluator::new(48_000, vec![samples])
+        Evaluator::new(
+            48_000,
+            Resources {
+                root: samples(),
+                sample_dirs: vec![samples()],
+            },
+        )
+    }
+
+    /// An evaluator whose code folder has a `slow` envelope (1 s attack, 1 s
+    /// release, straight lines), a `ramp` modulation (0 to 1 over 1 s), and a
+    /// sample `ones.wav` (a second of 1.0).
+    fn with_resources() -> (Evaluator, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "rocktober-eval-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let line = |time| Stage { time, curve: 0.0 };
+        Envelope {
+            attack: line(1.0),
+            decay: line(0.0),
+            sustain: 1.0,
+            release: line(1.0),
+        }
+        .save(&ResourceKind::Envelope.path(&root, "slow"))
+        .unwrap();
+        Modulation {
+            length: 1.0,
+            points: vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)],
+        }
+        .save(&ResourceKind::Modulation.path(&root, "ramp"))
+        .unwrap();
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut wav = hound::WavWriter::create(root.join("ones.wav"), spec).unwrap();
+        for _ in 0..48_000 * 2 {
+            wav.write_sample(1.0f32).unwrap();
+        }
+        wav.finalize().unwrap();
+        let evaluator = Evaluator::new(
+            48_000,
+            Resources {
+                root: root.clone(),
+                sample_dirs: vec![root.clone()],
+            },
+        );
+        (evaluator, root)
+    }
+
+    /// Render a node to completion, or `max` frames.
+    fn render_node(node: &mut dyn Node, max: usize) -> Vec<Frame> {
+        let mut all = Vec::new();
+        let mut buf = vec![[0.0; 2]; 512];
+        while all.len() < max {
+            let n = node.process(&mut buf);
+            all.extend_from_slice(&buf[..n]);
+            if n < buf.len() {
+                break;
+            }
+        }
+        all.truncate(max);
+        all
+    }
+
+    fn render_with(evaluator: &mut Evaluator, src: &str) -> Vec<Frame> {
+        let mut commands = evaluator.run(&parse(src).unwrap()).unwrap();
+        let Some(Command::Play(mut node)) = commands.pop() else {
+            panic!("nothing played")
+        };
+        render_node(node.as_mut(), 48_000 * 60)
     }
 
     /// Evaluate `src` (which must `play` exactly one sound) and render it.
     fn render(src: &str) -> Vec<Frame> {
-        let mut commands = evaluator().run(&parse(src).unwrap()).unwrap();
-        let Some(Command::Play(mut node)) = commands.pop() else {
-            panic!("nothing played")
-        };
-        let mut all = Vec::new();
-        let mut buf = vec![[0.0; 2]; 512];
-        loop {
-            let n = node.process(&mut buf);
-            all.extend_from_slice(&buf[..n]);
-            if n < buf.len() {
-                return all;
-            }
-        }
+        render_with(&mut evaluator(), src)
     }
 
     fn peak(frames: &[Frame]) -> f32 {
         frames.iter().flatten().fold(0.0, |m, s| m.max(s.abs()))
     }
 
-    fn error(src: &str) -> String {
-        match evaluator().run(&parse(src).unwrap()) {
+    fn error_with(evaluator: &mut Evaluator, src: &str) -> String {
+        match evaluator.run(&parse(src).unwrap()) {
             Ok(_) => panic!("expected an error"),
             Err(e) => e.msg,
         }
+    }
+
+    fn error(src: &str) -> String {
+        error_with(&mut evaluator(), src)
     }
 
     #[test]
@@ -443,7 +879,7 @@ mod tests {
     fn argument_errors() {
         assert_eq!(
             error(r#"sample("kick.mp3").gain(sample("kick.mp3"))"#),
-            "gain: expected an amount (like 0.5 or -6db), got a sound"
+            "gain: expected an amount (like 0.5, -6db or an envelope), got a sound"
         );
         assert_eq!(
             error(r#"0.5.gain(sample("kick.mp3"))"#),
@@ -458,6 +894,25 @@ mod tests {
             "limit: expected a positive ceiling (like 0.9 or -1db), got a number"
         );
         assert_eq!(error("limit()"), "limit takes 1 or 2 argument(s), got 0");
+        assert_eq!(error("sample()"), "sample takes 1 to 3 argument(s), got 0");
+        assert_eq!(error("nope()"), "unknown function 'nope'");
+        // Overloads: blamed on the argument the closest signatures got stuck on.
+        assert_eq!(
+            error(r#"sample("kick.mp3") * "loud""#),
+            "mul: expected a sound or a control, got a string"
+        );
+        assert_eq!(
+            error(r#"add(sample("kick.mp3"), 3)"#),
+            "add: expected a sound, got a number"
+        );
+        assert_eq!(
+            error(r#"sample("kick.mp3").reverb(2)"#),
+            "reverb: expected a space name or a sound, got a number"
+        );
+        assert_eq!(
+            error(r#"play(4.repeat(2))"#),
+            "repeat: expected a sound or a modulation, got a number"
+        );
     }
 
     #[test]
@@ -550,6 +1005,86 @@ mod tests {
     fn both_call_styles_are_equivalent() {
         let a = render(r#"play(repeat(fit(gain(sample("kick.mp3"), 0.5), 100ms), 3))"#);
         let b = render(r#"sample("kick.mp3").gain(0.5).fit(100ms).repeat(3).play"#);
+        let c = render(r#"(sample("kick.mp3") * 0.5).fit(100ms).repeat(3).play"#);
         assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    /// One second of a constant 1.0 (see `with_resources`).
+    const ONES: &str = r#"sample("ones.wav")"#;
+
+    #[test]
+    fn numbers_and_controls_combine() {
+        let (mut ev, root) = with_resources();
+        // Plain number arithmetic stays numbers.
+        let half = render_with(&mut ev, &format!("({ONES} * (0.25 + 0.25)).play"));
+        assert_eq!(half[100], [0.5, 0.5]);
+        // A modulation shapes a sound: here a ramp from 0 to 1 over a second.
+        let ramp = render_with(&mut ev, &format!(r#"({ONES} * modulation("ramp")).play"#));
+        assert_eq!(ramp.len(), 48_000);
+        assert!((ramp[24_000][0] - 0.5).abs() < 1e-3);
+        // Controls combine: half the ramp, plus a quarter.
+        let mixed = render_with(
+            &mut ev,
+            &format!(r#"({ONES} * (modulation("ramp") * 0.5 + 0.25)).play"#),
+        );
+        assert!((mixed[24_000][0] - 0.5).abs() < 1e-3);
+        assert!((mixed[0][0] - 0.25).abs() < 1e-3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_modulation_is_an_lfo() {
+        let (mut ev, root) = with_resources();
+        let saw = render_with(
+            &mut ev,
+            &format!(r#"{ONES}.repeat(3).gain(modulation("ramp").repeat(2)).play"#),
+        );
+        assert!((saw[12_000][0] - 0.25).abs() < 1e-3);
+        assert!((saw[48_000 + 12_000][0] - 0.25).abs() < 1e-3);
+        // After two passes it holds its last value.
+        assert!((saw[48_000 * 2 + 12_000][0] - 1.0).abs() < 1e-3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gated_envelope_ends_the_sound_after_its_release() {
+        let (mut ev, root) = with_resources();
+        let note = render_with(
+            &mut ev,
+            &format!(r#"({ONES}.repeat(inf) * envelope("slow").gate(1500ms)).play"#),
+        );
+        // 1.5 s held, then 1 s of release, then it's over.
+        assert_eq!(note.len(), 48_000 * 5 / 2);
+        assert!(
+            (note[24_000][0] - 0.5).abs() < 1e-3,
+            "halfway up the attack"
+        );
+        assert!(
+            (note[48_000 * 2][0] - 0.5).abs() < 1e-3,
+            "halfway down the release"
+        );
+        // Without a gate it never releases: the sound lasts as long as it does.
+        let held = render_with(&mut ev, &format!(r#"({ONES} * envelope("slow")).play"#));
+        assert_eq!(held.len(), 48_000);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resource_errors() {
+        let (mut ev, root) = with_resources();
+        assert_eq!(
+            error_with(&mut ev, r#"envelope("nope")"#),
+            "envelope: \"nope\" doesn't exist yet (envelopes/nope.json): put the cursor on it to create it"
+        );
+        assert_eq!(
+            error_with(&mut ev, r#"modulation("ramp").gate(1s)"#),
+            "gate: expected an envelope, got a control"
+        );
+        assert_eq!(
+            error_with(&mut ev, r#"play(modulation("ramp"))"#),
+            "play: expected a sound, got a control"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

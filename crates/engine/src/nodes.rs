@@ -7,6 +7,9 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use crate::control::Param;
+use crate::engine::MAX_BLOCK;
+
 /// One stereo frame: [left, right].
 pub type Frame = [f32; 2];
 
@@ -417,34 +420,95 @@ impl Node for Delay {
     }
 }
 
-/// Multiplies its child by a constant.
+/// Multiplies its child by an amount: a constant, or a control signal (an
+/// envelope, a modulation). Ends when either ends.
 pub struct Gain {
     child: Box<dyn Node>,
-    amount: f32,
+    amount: Param,
 }
 
 impl Gain {
-    pub fn new(amount: f32, child: Box<dyn Node>) -> Self {
+    pub fn new(amount: Param, child: Box<dyn Node>) -> Self {
         Self { child, amount }
     }
 }
 
 impl Node for Gain {
     fn process(&mut self, out: &mut [Frame]) -> usize {
-        let n = self.child.process(out);
-        for frame in &mut out[..n] {
-            frame[0] *= self.amount;
-            frame[1] *= self.amount;
+        let mut done = 0;
+        while done < out.len() {
+            let len = (out.len() - done).min(self.amount.block());
+            let chunk = &mut out[done..done + len];
+            let n = self.child.process(chunk);
+            let n = self.amount.next(n);
+            for (i, frame) in chunk[..n].iter_mut().enumerate() {
+                let amount = self.amount.get(i);
+                frame[0] *= amount;
+                frame[1] *= amount;
+            }
+            done += n;
+            if n < len {
+                break;
+            }
         }
-        n
+        done
     }
 
     fn reset(&mut self) {
         self.child.reset();
+        self.amount.reset();
     }
 
     fn skip(&mut self, frames: usize) -> usize {
-        self.child.skip(frames)
+        let n = self.child.skip(frames);
+        self.amount.skip(n)
+    }
+}
+
+/// Multiplies two sounds frame by frame (ring modulation). Ends when either
+/// ends.
+pub struct Multiply {
+    a: Box<dyn Node>,
+    b: Box<dyn Node>,
+    buf: Vec<Frame>,
+}
+
+impl Multiply {
+    pub fn new(a: Box<dyn Node>, b: Box<dyn Node>) -> Self {
+        Self {
+            a,
+            b,
+            buf: vec![[0.0; 2]; MAX_BLOCK],
+        }
+    }
+}
+
+impl Node for Multiply {
+    fn process(&mut self, out: &mut [Frame]) -> usize {
+        let mut done = 0;
+        for chunk in out.chunks_mut(self.buf.len()) {
+            let n = self.a.process(chunk);
+            let m = self.b.process(&mut self.buf[..n]);
+            for (x, y) in chunk.iter_mut().zip(&self.buf[..m]) {
+                x[0] *= y[0];
+                x[1] *= y[1];
+            }
+            done += m;
+            if m < chunk.len() {
+                break;
+            }
+        }
+        done
+    }
+
+    fn reset(&mut self) {
+        self.a.reset();
+        self.b.reset();
+    }
+
+    fn skip(&mut self, frames: usize) -> usize {
+        let n = self.a.skip(frames);
+        self.b.skip(n)
     }
 }
 
@@ -596,6 +660,7 @@ impl Node for Limit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::Constant;
 
     fn ones(n: usize) -> Box<dyn Node> {
         let data = SampleData {
@@ -744,8 +809,35 @@ mod tests {
 
     #[test]
     fn gain_scales() {
-        let out = render(&mut Gain::new(0.5, ones(3)));
+        let out = render(&mut Gain::new(Param::Const(0.5), ones(3)));
         assert_eq!(out, vec![[0.5, 0.5]; 3]);
+    }
+
+    #[test]
+    fn gain_follows_a_control_and_ends_with_it() {
+        struct Countdown(usize);
+        impl crate::control::ControlNode for Countdown {
+            fn process(&mut self, out: &mut [f32]) -> usize {
+                let n = out.len().min(self.0);
+                out[..n].fill(0.25);
+                self.0 -= n;
+                n
+            }
+            fn reset(&mut self) {}
+        }
+        let out = render(&mut Gain::new(
+            Param::signal(Box::new(Countdown(10))),
+            ones(20),
+        ));
+        assert_eq!(out, vec![[0.25, 0.25]; 10]);
+        let steady = Param::signal(Box::new(Constant(0.5)));
+        assert_eq!(render(&mut Gain::new(steady, ones(3000))).len(), 3000);
+    }
+
+    #[test]
+    fn multiply_ends_with_the_shorter() {
+        let out = render(&mut Multiply::new(ones(5), constant(0.5, 8)));
+        assert_eq!(out, vec![[0.5, 0.5]; 5]);
     }
 
     #[test]

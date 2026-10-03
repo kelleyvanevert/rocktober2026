@@ -1,3 +1,4 @@
+pub mod control;
 pub mod curve;
 pub mod engine;
 pub mod envelope;

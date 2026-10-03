@@ -67,3 +67,10 @@ sample("recordings/2026-05-19 Noa, Carlota.m4a", 6:43:500, 6:46:950).play
 envelope("kelley")
 
 modulation("bla")
+
+
+(sample("kick.mp3").repeat(inf) * envelope("kelley").gate(2s)).play
+
+sample("recordings/2026-10-02 Silje 3.m4a").gain(modulation("sweep")).play
+
+(sample("kick.mp3").fit(125ms).repeat(inf) * (modulation("sweep").repeat(inf) * 0.5 + 0.5)).play

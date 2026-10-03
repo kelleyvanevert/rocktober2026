@@ -15,6 +15,7 @@ use crate::eval::Evaluator;
 use crate::lang;
 use crate::nodes::{Frame, Node};
 use crate::recorder::Recording;
+use crate::resource::Resources;
 
 pub struct Session {
     pub device_name: String,
@@ -39,7 +40,7 @@ enum Output {
 
 impl Session {
     /// Open the default output device and start the audio thread.
-    pub fn start(sample_dirs: Vec<PathBuf>) -> Result<Self, String> {
+    pub fn start(resources: Resources) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or("no output device")?;
         let supported = device.default_output_config().map_err(|e| e.to_string())?;
@@ -80,7 +81,7 @@ impl Session {
             channels: config.channels,
             commands,
             status,
-            evaluator: Evaluator::new(config.sample_rate, sample_dirs),
+            evaluator: Evaluator::new(config.sample_rate, resources),
             sent: 0,
             recording: None,
             _output: Output::Device(stream),
@@ -89,7 +90,7 @@ impl Session {
 
     /// A session that evaluates code but plays nothing, for tests. Commands are
     /// queued but never consumed, so don't call `wait_until_idle` on it.
-    pub fn without_output(sample_rate: u32, sample_dirs: Vec<PathBuf>) -> Self {
+    pub fn without_output(sample_rate: u32, resources: Resources) -> Self {
         let (commands, commands_rx) = rtrb::RingBuffer::<Command>::new(256);
         let (garbage_tx, _) = rtrb::RingBuffer::<Box<dyn Node>>::new(1);
         let status = Arc::new(Status::default());
@@ -100,7 +101,7 @@ impl Session {
             channels: 2,
             commands,
             status,
-            evaluator: Evaluator::new(sample_rate, sample_dirs),
+            evaluator: Evaluator::new(sample_rate, resources),
             sent: 0,
             recording: None,
             _output: Output::None(engine),
@@ -116,9 +117,9 @@ impl Session {
         Ok(())
     }
 
-    /// Where `sample("...")` looks for files, in order.
-    pub fn sample_dirs(&self) -> &[PathBuf] {
-        self.evaluator.sample_dirs()
+    /// Where the code's samples, envelopes, ... are.
+    pub fn resources(&self) -> &Resources {
+        self.evaluator.resources()
     }
 
     /// Fade out everything that's playing.

@@ -1,10 +1,11 @@
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::Path;
 
 use rocktober_engine::Session;
+use rocktober_engine::resource::Resources;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut session = Session::start(vec![PathBuf::from("."), PathBuf::from("samples")])?;
+    let mut session = Session::start(Resources::for_code(Path::new("main.rock")))?;
     println!(
         "output: {} ({} Hz, {} ch)",
         session.device_name, session.sample_rate, session.channels
