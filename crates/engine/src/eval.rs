@@ -12,6 +12,10 @@
 //! `builtins`); a name can have several, and a call runs the first whose
 //! parameter types the arguments fit. Errors are generated from the
 //! signatures, so they say what was expected where.
+//!
+//! A control can be a hole (`?pos`), to be filled in later with `.with(pos:
+//! ...)`. Filling holes makes a new description, so one instrument can be
+//! filled in several ways; nothing is instantiated until `play`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,6 +32,7 @@ use crate::nodes::{
 use crate::resource::{self, ResourceKind, Resources};
 use crate::reverb::{self, Impulse, MAX_IR_SECONDS, Reverb};
 use crate::sample;
+use crate::wavetable::{self, Oscillator, Wavetable};
 
 /// Fade-out applied where `fit` cuts a sound off. A few ms is enough to remove the
 /// click without audibly softening a transient.
@@ -58,9 +63,65 @@ pub enum Sound {
     Limit(f64, Box<Sound>),
     /// Impulse response and wet/dry mix.
     Reverb(Box<Sound>, Arc<Impulse>, f64),
+    Wavetable {
+        table: Arc<Wavetable>,
+        position: Control,
+        warp: Control,
+        /// A MIDI note number.
+        pitch: Control,
+    },
 }
 
 impl Sound {
+    /// The same sound with every control replaced by `f(control)`.
+    fn map_controls(&self, f: &mut dyn FnMut(&Control) -> Control) -> Sound {
+        let mut m = |s: &Sound| Box::new(s.map_controls(f));
+        match self {
+            Sound::Sample(data) => Sound::Sample(data.clone()),
+            Sound::Fit(child, seconds) => Sound::Fit(m(child), *seconds),
+            Sound::Delay(child, seconds) => Sound::Delay(m(child), *seconds),
+            Sound::Slice(child, start, end) => Sound::Slice(m(child), *start, *end),
+            Sound::Repeat(child, times) => Sound::Repeat(m(child), *times),
+            Sound::Add(children) => {
+                Sound::Add(children.iter().map(|c| c.map_controls(f)).collect())
+            }
+            Sound::Seq(children) => {
+                Sound::Seq(children.iter().map(|c| c.map_controls(f)).collect())
+            }
+            Sound::Gain(amount, child) => {
+                let amount = f(amount);
+                Sound::Gain(amount, Box::new(child.map_controls(f)))
+            }
+            Sound::Multiply(a, b) => {
+                let a = m(a);
+                Sound::Multiply(a, Box::new(b.map_controls(f)))
+            }
+            Sound::Limit(ceiling, child) => Sound::Limit(*ceiling, m(child)),
+            Sound::Reverb(child, impulse, mix) => Sound::Reverb(m(child), impulse.clone(), *mix),
+            Sound::Wavetable {
+                table,
+                position,
+                warp,
+                pitch,
+            } => Sound::Wavetable {
+                table: table.clone(),
+                position: f(position),
+                warp: f(warp),
+                pitch: f(pitch),
+            },
+        }
+    }
+
+    /// Every hole in the sound, and whether it has a default.
+    fn holes(&self) -> Vec<(String, bool)> {
+        let mut holes = Vec::new();
+        self.map_controls(&mut |c| {
+            c.holes(&mut holes);
+            c.clone()
+        });
+        holes
+    }
+
     pub fn instantiate(&self, sample_rate: u32) -> Box<dyn Node> {
         let frames = |seconds: f64| (seconds * sample_rate as f64).round() as usize;
         match self {
@@ -113,6 +174,18 @@ impl Sound {
                 frames(LIMIT_LOOKAHEAD_SECONDS),
                 (LIMIT_RELEASE_SECONDS * sample_rate as f64) as f32,
             )),
+            Sound::Wavetable {
+                table,
+                position,
+                warp,
+                pitch,
+            } => Box::new(Oscillator::new(
+                table.clone(),
+                position.param(sample_rate),
+                warp.param(sample_rate),
+                pitch.param(sample_rate),
+                sample_rate,
+            )),
         }
     }
 }
@@ -127,9 +200,36 @@ pub enum Control {
     Envelope(Arc<Envelope>, Option<f64>),
     Mul(Box<Control>, Box<Control>),
     Add(Box<Control>, Box<Control>),
+    /// `?name`, filled in by `with`. Unfilled, it's its default (or 0, but
+    /// `play` refuses holes without one).
+    Hole {
+        name: String,
+        default: Option<Box<Control>>,
+    },
 }
 
 impl Control {
+    fn holes(&self, out: &mut Vec<(String, bool)>) {
+        match self {
+            Control::Hole { name, default } => out.push((name.clone(), default.is_some())),
+            Control::Mul(a, b) | Control::Add(a, b) => {
+                a.holes(out);
+                b.holes(out);
+            }
+            _ => {}
+        }
+    }
+
+    /// The same control with the holes in `values` filled.
+    fn fill(&self, values: &HashMap<String, Control>) -> Control {
+        match self {
+            Control::Hole { name, .. } if values.contains_key(name) => values[name].clone(),
+            Control::Mul(a, b) => Control::Mul(Box::new(a.fill(values)), Box::new(b.fill(values))),
+            Control::Add(a, b) => Control::Add(Box::new(a.fill(values)), Box::new(b.fill(values))),
+            other => other.clone(),
+        }
+    }
+
     pub fn instantiate(&self, sample_rate: u32) -> Box<dyn ControlNode> {
         match self {
             Control::Constant(v) => Box::new(control::Constant(*v as f32)),
@@ -150,6 +250,10 @@ impl Control {
                 b.instantiate(sample_rate),
                 |a, b| a + b,
             )),
+            Control::Hole { default, .. } => match default {
+                Some(default) => default.instantiate(sample_rate),
+                None => Box::new(control::Constant(0.0)),
+            },
         }
     }
 
@@ -157,6 +261,10 @@ impl Control {
     fn param(&self, sample_rate: u32) -> Param {
         match self {
             Control::Constant(v) => Param::Const(*v as f32),
+            Control::Hole {
+                default: Some(default),
+                ..
+            } => default.param(sample_rate),
             other => Param::signal(other.instantiate(sample_rate)),
         }
     }
@@ -169,7 +277,10 @@ pub enum Type {
     Envelope,
     Number,
     Duration,
+    Pitch,
     String,
+    /// `name: value`, for `with`.
+    Binding,
     Nothing,
 }
 
@@ -181,7 +292,9 @@ impl Type {
             Type::Envelope => "an envelope",
             Type::Number => "a number",
             Type::Duration => "a duration",
+            Type::Pitch => "a pitch",
             Type::String => "a string",
+            Type::Binding => "a binding (like pos: 0.2)",
             Type::Nothing => "nothing",
         }
     }
@@ -195,6 +308,9 @@ enum Value {
     Str(String),
     Num(f64),
     Duration(f64),
+    /// A MIDI note number.
+    Pitch(f64),
+    Binding(String, Box<Value>),
     Nothing,
 }
 
@@ -207,6 +323,8 @@ impl Value {
             Value::Str(_) => Type::String,
             Value::Num(_) => Type::Number,
             Value::Duration(_) => Type::Duration,
+            Value::Pitch(_) => Type::Pitch,
+            Value::Binding(..) => Type::Binding,
             Value::Nothing => Type::Nothing,
         }
     }
@@ -214,7 +332,8 @@ impl Value {
     /// Whether this value can be passed where `ty` is expected.
     fn fits(&self, ty: Type) -> bool {
         self.ty() == ty
-            || (ty == Type::Control && matches!(self, Value::Num(_) | Value::Envelope(_)))
+            || (ty == Type::Control
+                && matches!(self, Value::Num(_) | Value::Pitch(_) | Value::Envelope(_)))
     }
 
     // Accessors for arguments whose type a signature has already checked.
@@ -229,7 +348,7 @@ impl Value {
     fn control(&self) -> Control {
         match self {
             Value::Control(c) => c.clone(),
-            Value::Num(n) => Control::Constant(*n),
+            Value::Num(n) | Value::Pitch(n) => Control::Constant(*n),
             Value::Envelope(env) => Control::Envelope(env.clone(), None),
             _ => unreachable!("not a control"),
         }
@@ -378,8 +497,23 @@ fn builtins() -> Vec<Builtin> {
     const END: P = P(Type::Duration, "an end time (like 0:12:625)");
     const AMOUNT: P = P(Type::Control, "an amount (like 0.5, -6db or an envelope)");
 
+    const BINDING: P = P(Type::Binding, "a binding (like pos: 0.2)");
+
     vec![
         builtin("play", &[SOUND], 1, |ev, c| {
+            let unfilled: Vec<String> = c
+                .sound(0)
+                .holes()
+                .into_iter()
+                .filter(|(_, default)| !default)
+                .map(|(name, _)| name)
+                .collect();
+            if let Some(name) = unfilled.first() {
+                return Err(Error {
+                    pos: c.pos,
+                    msg: format!("play: ?{name} has no value (fill it with .with({name}: ...))"),
+                });
+            }
             let node = c.sound(0).instantiate(ev.sample_rate);
             c.commands.push(Command::Play(node));
             Ok(Value::Nothing)
@@ -417,6 +551,58 @@ fn builtins() -> Vec<Builtin> {
                 Err(msg) => Err(c.fail(0, msg)),
             },
         ),
+        builtin(
+            "wavetable",
+            &[
+                P(Type::String, "a wavetable name"),
+                P(Type::Control, "a position (0 to 1)"),
+                P(Type::Control, "a warp amount (0 to 1)"),
+                P(Type::Control, "a pitch (like c2)"),
+            ],
+            1,
+            |ev, c| {
+                let table = ev
+                    .wavetable(c.args[0].str())
+                    .map_err(|msg| c.fail(0, msg))?;
+                let arg = |i: usize, default| {
+                    c.args
+                        .get(i)
+                        .map_or(Control::Constant(default), Value::control)
+                };
+                sound(Sound::Wavetable {
+                    table,
+                    position: arg(1, 0.0),
+                    warp: arg(2, 0.0),
+                    // Middle C.
+                    pitch: arg(3, 60.0),
+                })
+            },
+        ),
+        Builtin {
+            rest: Some(BINDING),
+            ..builtin("with", &[SOUND], 1, |_, c| {
+                let values = fill_values(c, &c.sound(0).holes())?;
+                sound(
+                    c.sound(0)
+                        .map_controls(&mut |control| control.fill(&values)),
+                )
+            })
+        },
+        Builtin {
+            rest: Some(BINDING),
+            ..builtin(
+                "with",
+                &[P(Type::Control, "a sound or a control")],
+                1,
+                |_, c| {
+                    let control = c.control(0);
+                    let mut holes = Vec::new();
+                    control.holes(&mut holes);
+                    let values = fill_values(c, &holes)?;
+                    Ok(Value::Control(control.fill(&values)))
+                },
+            )
+        },
         builtin(
             "gate",
             &[
@@ -552,6 +738,36 @@ fn builtins() -> Vec<Builtin> {
     ]
 }
 
+/// The values `with` fills holes with, checked against the holes there are.
+fn fill_values(c: &Call, holes: &[(String, bool)]) -> Result<HashMap<String, Control>, Error> {
+    let mut values = HashMap::new();
+    for (i, arg) in c.args.iter().enumerate().skip(1) {
+        let Value::Binding(name, value) = arg else {
+            unreachable!("not a binding")
+        };
+        if !holes.iter().any(|(hole, _)| hole == name) {
+            let mut names: Vec<String> = holes.iter().map(|(h, _)| format!("?{h}")).collect();
+            names.dedup();
+            let there = match names.as_slice() {
+                [] => "there are no holes".to_string(),
+                names => format!("there's {}", names.join(", ")),
+            };
+            return Err(c.fail(i, format!("there's no ?{name} to fill ({there})")));
+        }
+        if !value.fits(Type::Control) {
+            return Err(c.fail(
+                i,
+                format!(
+                    "{name}: expected a control, number or pitch, got {}",
+                    value.ty().name()
+                ),
+            ));
+        }
+        values.insert(name.clone(), value.control());
+    }
+    Ok(values)
+}
+
 fn repeat_count(c: &Call) -> Result<usize, Error> {
     let n = c.args[1].num();
     if n == f64::INFINITY {
@@ -585,6 +801,12 @@ pub struct Evaluator {
     cache: HashMap<(PathBuf, Window), Arc<SampleData>>,
     /// Prepared preset impulse responses, by name.
     spaces: HashMap<String, Arc<Impulse>>,
+    /// Wavetables by name (built-in) or path and modification time (files).
+    /// Like samples, they're kept so they're never freed on the audio thread.
+    wavetables: HashMap<String, Arc<Wavetable>>,
+    /// Values named with `let`. They live as long as the evaluator, so a block
+    /// can use what an earlier one defined.
+    vars: HashMap<String, Value>,
 }
 
 impl Evaluator {
@@ -594,6 +816,8 @@ impl Evaluator {
             resources,
             cache: HashMap::new(),
             spaces: HashMap::new(),
+            wavetables: HashMap::new(),
+            vars: HashMap::new(),
         }
     }
 
@@ -603,10 +827,15 @@ impl Evaluator {
 
     /// Evaluate a program, returning the commands it wants sent to the audio thread.
     /// Nothing is sent if any statement fails, so a typo never half-plays a line.
+    /// (The same goes for `let`s: they only take effect if everything succeeds.)
     pub fn run(&mut self, program: &[Spanned]) -> Result<Vec<Command>, Error> {
+        let vars = self.vars.clone();
         let mut commands = Vec::new();
         for stmt in program {
-            self.eval(stmt, &mut commands)?;
+            if let Err(e) = self.eval(stmt, &mut commands) {
+                self.vars = vars;
+                return Err(e);
+            }
         }
         Ok(commands)
     }
@@ -617,6 +846,44 @@ impl Evaluator {
             Expr::Str(s) => return Ok(Value::Str(s.clone())),
             Expr::Num(n) => return Ok(Value::Num(*n)),
             Expr::Duration(d) => return Ok(Value::Duration(*d)),
+            Expr::Pitch(note) => return Ok(Value::Pitch(*note)),
+            Expr::Var(name) => {
+                return match self.vars.get(name) {
+                    Some(value) => Ok(value.clone()),
+                    None if BUILTINS.iter().any(|b| b.name == name) => {
+                        fail(format!("'{name}' is a function: call it with {name}(...)"))
+                    }
+                    None => fail(format!("unknown name '{name}'")),
+                };
+            }
+            Expr::Let { name, value } => {
+                let value = self.eval(value, commands)?;
+                self.vars.insert(name.clone(), value);
+                return Ok(Value::Nothing);
+            }
+            Expr::Hole { name, default } => {
+                let default = match default {
+                    None => None,
+                    Some(d) => match self.eval(d, commands)? {
+                        v if v.fits(Type::Control) => Some(Box::new(v.control())),
+                        v => {
+                            return Err(Error {
+                                pos: d.pos,
+                                msg: format!(
+                                    "?{name}: expected a default like 0.2 or c2, got {}",
+                                    v.ty().name()
+                                ),
+                            });
+                        }
+                    },
+                };
+                let name = name.clone();
+                return Ok(Value::Control(Control::Hole { name, default }));
+            }
+            Expr::Named { name, value } => {
+                let value = self.eval(value, commands)?;
+                return Ok(Value::Binding(name.clone(), Box::new(value)));
+            }
             Expr::Call { name, args } => (name.as_str(), args),
         };
 
@@ -735,6 +1002,33 @@ impl Evaluator {
                 kind.file_name(name)
             ))
         }
+    }
+
+    /// A built-in wavetable, or one from `wavetables/`.
+    fn wavetable(&mut self, name: &str) -> Result<Arc<Wavetable>, String> {
+        let path = ResourceKind::Wavetable.path(&self.resources.root, name);
+        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let key = match modified {
+            Some(time) => format!("{}@{time:?}", path.display()),
+            None => name.to_string(),
+        };
+        if let Some(table) = self.wavetables.get(&key) {
+            return Ok(table.clone());
+        }
+        let table = match modified {
+            Some(_) => Wavetable::load(&path)?,
+            None => Wavetable::builtin(name).ok_or_else(|| {
+                format!(
+                    "unknown wavetable \"{name}\" (try {}, or add {}/{})",
+                    wavetable::BUILTIN_NAMES.join(", "),
+                    ResourceKind::Wavetable.dir(),
+                    ResourceKind::Wavetable.file_name(name)
+                )
+            })?,
+        };
+        let table = Arc::new(table);
+        self.wavetables.insert(key, table.clone());
+        Ok(table)
     }
 
     fn load_envelope(&self, name: &str) -> Result<Envelope, String> {
@@ -1068,6 +1362,95 @@ mod tests {
         let held = render_with(&mut ev, &format!(r#"({ONES} * envelope("slow")).play"#));
         assert_eq!(held.len(), 48_000);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Upward zero crossings per second.
+    fn frequency(frames: &[Frame]) -> f32 {
+        let crossings = frames
+            .windows(2)
+            .filter(|w| w[0][0] < 0.0 && w[1][0] >= 0.0)
+            .count();
+        crossings as f32 * 48_000.0 / frames.len() as f32
+    }
+
+    fn run(ev: &mut Evaluator, src: &str) {
+        ev.run(&parse(src).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn wavetables_play_notes() {
+        let mut ev = evaluator();
+        let a4 = render_with(&mut ev, r#"wavetable("basic", 0, 0, a4).fit(1s).play"#);
+        assert_eq!(a4.len(), 48_000);
+        assert!((frequency(&a4) - 440.0).abs() <= 1.0);
+        // Pitches are note numbers, so adding 12 is an octave up.
+        let a5 = render_with(&mut ev, r#"wavetable("basic", 0, 0, a4 + 12).fit(1s).play"#);
+        assert!((frequency(&a5) - 880.0).abs() <= 1.0);
+        // Defaults: the first frame, no warp, middle C.
+        let c4 = render_with(&mut ev, r#"wavetable("sine-saw").fit(1s).play"#);
+        assert!((frequency(&c4) - 261.6).abs() <= 1.0);
+        assert!(
+            error_with(&mut ev, r#"wavetable("nope")"#)
+                .starts_with("wavetable: unknown wavetable \"nope\" (try basic, ")
+        );
+        assert_eq!(
+            error_with(&mut ev, r#"wavetable("basic", sample("kick.mp3"))"#),
+            "wavetable: expected a position (0 to 1), got a sound"
+        );
+    }
+
+    #[test]
+    fn holes_are_filled_by_with() {
+        let mut ev = evaluator();
+        run(
+            &mut ev,
+            r#"let lead = wavetable("basic", ?pos = 0.2, 0, ?note).fit(100ms)"#,
+        );
+        assert_eq!(
+            error_with(&mut ev, "lead.play"),
+            "play: ?note has no value (fill it with .with(note: ...))"
+        );
+        // One instrument, filled in two ways.
+        let a4 = render_with(&mut ev, "lead.with(note: a4).play");
+        let a5 = render_with(&mut ev, "lead.with(note: a5).play");
+        assert_eq!(a4.len(), 4800);
+        assert!((frequency(&a4) - 440.0).abs() <= 10.0);
+        assert!((frequency(&a5) - 880.0).abs() <= 10.0);
+        // Filling a hole with a default overrides it; filling in steps works.
+        let brighter = render_with(&mut ev, "lead.with(pos: 1).with(note: a4).play");
+        assert_ne!(brighter, a4);
+        // A hole can be filled by anything that's a control.
+        run(&mut ev, "let up = ?base + 12");
+        let octave = render_with(
+            &mut ev,
+            r#"wavetable("basic", 0, 0, up.with(base: a4)).fit(100ms).play"#,
+        );
+        assert!((frequency(&octave) - 880.0).abs() <= 10.0);
+        assert_eq!(
+            error_with(&mut ev, "lead.with(nope: 1)"),
+            "with: there's no ?nope to fill (there's ?pos, ?note)"
+        );
+        assert_eq!(
+            error_with(&mut ev, r#"lead.with(note: sample("kick.mp3"))"#),
+            "with: note: expected a control, number or pitch, got a sound"
+        );
+        assert_eq!(
+            error_with(&mut ev, r#"wavetable("basic", ?pos = "x")"#),
+            "?pos: expected a default like 0.2 or c2, got a string"
+        );
+    }
+
+    #[test]
+    fn lets_only_stick_when_the_block_succeeds() {
+        let mut ev = evaluator();
+        assert!(ev.run(&parse("let x = 1\nnope()").unwrap()).is_err());
+        assert_eq!(error_with(&mut ev, "x.repeat(2)"), "unknown name 'x'");
+        run(&mut ev, "let x = 1");
+        run(&mut ev, "let y = x + 1");
+        assert_eq!(
+            error_with(&mut ev, "stop"),
+            "'stop' is a function: call it with stop(...)"
+        );
     }
 
     #[test]

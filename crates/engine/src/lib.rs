@@ -11,5 +11,6 @@ pub mod resource;
 pub mod reverb;
 pub mod sample;
 mod session;
+pub mod wavetable;
 
 pub use session::Session;

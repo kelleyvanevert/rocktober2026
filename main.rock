@@ -74,3 +74,13 @@ modulation("bla")
 sample("recordings/2026-10-02 Silje 3.m4a").gain(modulation("sweep")).play
 
 (sample("kick.mp3").fit(125ms).repeat(inf) * (modulation("sweep").repeat(inf) * 0.5 + 0.5)).play
+
+
+
+let lead = wavetable("basic", ?pos = 0.2, ?warp, ?note) * envelope("kelley").gate(400ms)
+
+lead.with(warp: 0, note: c3).play
+
+lead.with(warp: 0.6, note: c2, pos: modulation("sweep")).play
+
+(wavetable("bright", modulation("sweep").repeat(inf), 0.3, c2 + 7) * 0.5).fit(8s).play

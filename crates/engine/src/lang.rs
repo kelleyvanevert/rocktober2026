@@ -18,6 +18,11 @@
 //! (sample("kick.mp3") * envelope("pluck").gate(100ms)).play
 //! ```
 //!
+//! Notes are written `c2`, `f#3`, `eb4` (`c4` is middle C, MIDI note 60; Ableton
+//! calls it C3). `let name = ...` names a value, and a bare `name` refers to it.
+//! `?name` is a hole to be filled in later, `?name = 0.2` one with a default,
+//! and `name: value` (only in arguments) fills one, as in `lead.with(pos: 0.2)`.
+//!
 //! The parser knows nothing about what `play` or `fit` mean; it just builds a tree.
 //! Giving the tree meaning is `eval`'s job.
 
@@ -33,6 +38,25 @@ pub enum Expr {
     Num(f64),
     /// In seconds.
     Duration(f64),
+    /// A MIDI note number.
+    Pitch(f64),
+    /// A name given with `let`.
+    Var(String),
+    /// `let name = value`, only as a statement.
+    Let {
+        name: String,
+        value: Box<Spanned>,
+    },
+    /// `?name` or `?name = default`.
+    Hole {
+        name: String,
+        default: Option<Box<Spanned>>,
+    },
+    /// `name: value`, only as an argument.
+    Named {
+        name: String,
+        value: Box<Spanned>,
+    },
 }
 
 /// An expression plus its byte offset in the source, for error messages.
@@ -73,6 +97,36 @@ pub(crate) enum Token {
     Dot,
     Star,
     Plus,
+    Pitch(f64),
+    Let,
+    Question,
+    Colon,
+    Equals,
+}
+
+/// The MIDI note number of a note name like `c4` (60), `f#3` or `eb4`.
+fn pitch(text: &str) -> Option<f64> {
+    let bytes = text.as_bytes();
+    let (letter, rest) = bytes.split_first()?;
+    let semitone = match letter {
+        b'c' => 0,
+        b'd' => 2,
+        b'e' => 4,
+        b'f' => 5,
+        b'g' => 7,
+        b'a' => 9,
+        b'b' => 11,
+        _ => return None,
+    };
+    let (accidental, rest) = match rest {
+        [b'#', rest @ ..] => (1, rest),
+        [b'b', rest @ ..] => (-1, rest),
+        rest => (0, rest),
+    };
+    let [octave @ b'0'..=b'9'] = rest else {
+        return None;
+    };
+    Some((12 * (*octave as i32 - b'0' as i32 + 1) + semitone + accidental) as f64)
 }
 
 /// Whether a '.' or '-' at `i` begins (or continues) a number rather than being
@@ -111,13 +165,18 @@ pub(crate) fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                     i += 1;
                 }
             }
-            b'(' | b')' | b',' | b'.' | b'*' | b'+' if !starts_number(bytes, i) => {
+            b'(' | b')' | b',' | b'.' | b'*' | b'+' | b'?' | b':' | b'='
+                if !starts_number(bytes, i) =>
+            {
                 let tok = match c {
                     b'(' => Token::LParen,
                     b')' => Token::RParen,
                     b',' => Token::Comma,
                     b'*' => Token::Star,
                     b'+' => Token::Plus,
+                    b'?' => Token::Question,
+                    b':' => Token::Colon,
+                    b'=' => Token::Equals,
                     _ => Token::Dot,
                 };
                 tokens.push((tok, start));
@@ -180,9 +239,20 @@ pub(crate) fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
+                // A sharp note, like `f#3`.
+                if i == start + 1
+                    && bytes.get(i) == Some(&b'#')
+                    && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
+                {
+                    i += 2;
+                }
                 let tok = match &src[start..i] {
                     "inf" => Token::Num(f64::INFINITY),
-                    name => Token::Ident(name.to_string()),
+                    "let" => Token::Let,
+                    name => match pitch(name) {
+                        Some(note) => Token::Pitch(note),
+                        None => Token::Ident(name.to_string()),
+                    },
                 };
                 tokens.push((tok, start));
             }
@@ -217,6 +287,25 @@ impl Parser {
         } else {
             err(self.pos(), format!("expected {what}"))
         }
+    }
+
+    /// `let name = value`, or an expression.
+    fn statement(&mut self) -> Result<Spanned, Error> {
+        if self.peek() != Some(&Token::Let) {
+            return self.expr();
+        }
+        let pos = self.pos();
+        self.i += 1;
+        let Some(Token::Ident(name)) = self.peek().cloned() else {
+            return err(self.pos(), "expected a name after 'let'");
+        };
+        self.i += 1;
+        self.expect(Token::Equals, "'='")?;
+        let value = Box::new(self.expr()?);
+        Ok(Spanned {
+            expr: Expr::Let { name, value },
+            pos,
+        })
     }
 
     /// Terms joined by `+`, left to right.
@@ -284,6 +373,20 @@ impl Parser {
             Token::Str(s) => Expr::Str(s),
             Token::Num(n) => Expr::Num(n),
             Token::Duration(d) => Expr::Duration(d),
+            Token::Pitch(note) => Expr::Pitch(note),
+            Token::Question => {
+                let Some(Token::Ident(name)) = self.peek().cloned() else {
+                    return err(self.pos(), "expected a name after '?'");
+                };
+                self.i += 1;
+                let default = if self.peek() == Some(&Token::Equals) {
+                    self.i += 1;
+                    Some(Box::new(self.expr()?))
+                } else {
+                    None
+                };
+                Expr::Hole { name, default }
+            }
             Token::LParen => {
                 let inner = self.expr()?;
                 self.expect(Token::RParen, "')'")?;
@@ -291,7 +394,10 @@ impl Parser {
             }
             Token::Ident(name) => {
                 if self.peek() != Some(&Token::LParen) {
-                    return err(self.pos(), format!("expected '(' after '{name}'"));
+                    return Ok(Spanned {
+                        expr: Expr::Var(name),
+                        pos,
+                    });
                 }
                 let args = self.args()?;
                 Expr::Call { name, args }
@@ -306,7 +412,22 @@ impl Parser {
         self.expect(Token::LParen, "'('")?;
         let mut args = Vec::new();
         while self.peek() != Some(&Token::RParen) {
-            args.push(self.expr()?);
+            let named = match (self.peek(), self.tokens.get(self.i + 1)) {
+                (Some(Token::Ident(name)), Some((Token::Colon, _))) => Some(name.clone()),
+                _ => None,
+            };
+            match named {
+                Some(name) => {
+                    let pos = self.pos();
+                    self.i += 2;
+                    let value = Box::new(self.expr()?);
+                    args.push(Spanned {
+                        expr: Expr::Named { name, value },
+                        pos,
+                    });
+                }
+                None => args.push(self.expr()?),
+            }
             match self.peek() {
                 Some(Token::Comma) => self.i += 1,
                 Some(Token::RParen) => {}
@@ -327,7 +448,7 @@ pub fn parse(src: &str) -> Result<Vec<Spanned>, Error> {
     };
     let mut program = Vec::new();
     while parser.peek().is_some() {
-        program.push(parser.expr()?);
+        program.push(parser.statement()?);
     }
     Ok(program)
 }
@@ -382,6 +503,14 @@ mod tests {
                 Expr::Str(s) => format!("{s:?}"),
                 Expr::Num(n) => n.to_string(),
                 Expr::Duration(d) => format!("{d}s"),
+                Expr::Pitch(note) => format!("note{note}"),
+                Expr::Var(name) => name.clone(),
+                Expr::Let { name, value } => format!("let {name} = {}", show(&value.expr)),
+                Expr::Hole { name, default } => match default {
+                    Some(d) => format!("?{name}={}", show(&d.expr)),
+                    None => format!("?{name}"),
+                },
+                Expr::Named { name, value } => format!("{name}: {}", show(&value.expr)),
             }
         }
         let prog = parse(src).unwrap();
@@ -444,6 +573,39 @@ mod tests {
         assert!(parse("a() *").is_err());
         assert!(parse("(a()").is_err());
         assert_eq!(parse("a() * * b()").unwrap_err().pos, 6);
+    }
+
+    #[test]
+    fn notes() {
+        assert_eq!(
+            desugar("f(c4, a4, c#4, db4, b3, bb3, c0, g9)"),
+            "f(note60, note69, note61, note61, note59, note58, note12, note127)"
+        );
+        // Not notes: other letters, longer names, two-digit octaves.
+        assert_eq!(desugar("f(h2, c10, cc2, b)"), "f(h2, c10, cc2, b)");
+    }
+
+    #[test]
+    fn lets_vars_holes_and_named_arguments() {
+        assert_eq!(
+            desugar(
+                "let lead = wavetable(\"basic\", ?pos = 0.2, ?warp, ?note) * envelope(\"pluck\")"
+            ),
+            "let lead = mul(wavetable(\"basic\", ?pos=0.2, ?warp, ?note), envelope(\"pluck\"))"
+        );
+        assert_eq!(
+            desugar("lead.with(pos: 0.5, note: c2).play"),
+            "play(with(lead, pos: 0.5, note: note36))"
+        );
+        assert_eq!(desugar("lead"), "lead");
+        assert_eq!(
+            parse("let = 3").unwrap_err().msg,
+            "expected a name after 'let'"
+        );
+        assert_eq!(parse("let x 3").unwrap_err().msg, "expected '='");
+        assert_eq!(parse("f(?)").unwrap_err().msg, "expected a name after '?'");
+        let prog = parse("let a = 1\nlet b = 2\nf(a, b)").unwrap();
+        assert_eq!(prog.len(), 3);
     }
 
     #[test]
