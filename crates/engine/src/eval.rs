@@ -757,6 +757,7 @@ pub enum Type {
     Binding,
     /// `at 4b`: where things may start.
     Grid,
+    Function,
     Nothing,
 }
 
@@ -774,6 +775,7 @@ impl Type {
             Type::String => "a string",
             Type::Binding => "a binding (like pos: 0.2)",
             Type::Grid => "a start grid (like at 4b)",
+            Type::Function => "a function",
             Type::Nothing => "nothing",
         }
     }
@@ -793,8 +795,20 @@ enum Value {
     Pattern(Arc<Pattern>),
     Binding(String, Box<Value>),
     Grid(Grid),
+    Function(Arc<Function>),
     Nothing,
 }
+
+/// A function defined with `fn name(params) = body`.
+pub struct Function {
+    name: String,
+    params: Vec<String>,
+    body: Spanned,
+}
+
+/// How deep user functions may call each other (or themselves).
+const MAX_CALL_DEPTH: usize = 64;
+const TOO_DEEP: &str = "too many calls inside calls (does a function call itself?)";
 
 impl Value {
     fn ty(&self) -> Type {
@@ -810,6 +824,7 @@ impl Value {
             Value::Pitch(_) => Type::Pitch,
             Value::Binding(..) => Type::Binding,
             Value::Grid(_) => Type::Grid,
+            Value::Function(_) => Type::Function,
             Value::Nothing => Type::Nothing,
         }
     }
@@ -1680,6 +1695,8 @@ pub struct Evaluator {
     vars: HashMap<String, Value>,
     /// The buses `duck` listens to, by slot name.
     buses: HashMap<String, Arc<Bus>>,
+    /// How many user functions are being called inside each other.
+    depth: usize,
 }
 
 impl Evaluator {
@@ -1693,6 +1710,7 @@ impl Evaluator {
             bpm: Clock::DEFAULT_BPM,
             vars: HashMap::new(),
             buses: HashMap::new(),
+            depth: 0,
         }
     }
 
@@ -1752,6 +1770,19 @@ impl Evaluator {
                 self.vars.insert(name.clone(), value);
                 return Ok(Value::Nothing);
             }
+            Expr::Fn { name, params, body } => {
+                if BUILTINS.iter().any(|b| b.name == name) {
+                    return fail(format!("'{name}' is already a built-in function"));
+                }
+                let function = Function {
+                    name: name.clone(),
+                    params: params.clone(),
+                    body: (**body).clone(),
+                };
+                self.vars
+                    .insert(name.clone(), Value::Function(Arc::new(function)));
+                return Ok(Value::Nothing);
+            }
             Expr::Hole { name, default } => {
                 let default = match default {
                     None => None,
@@ -1780,7 +1811,14 @@ impl Evaluator {
 
         let candidates: Vec<&Builtin> = BUILTINS.iter().filter(|b| b.name == name).collect();
         if candidates.is_empty() {
-            return fail(format!("unknown function '{name}'"));
+            return match self.vars.get(name) {
+                Some(Value::Function(f)) => {
+                    let f = f.clone();
+                    self.call(&f, args, e.pos, actions)
+                }
+                Some(v) => fail(format!("'{name}' is {}, not a function", v.ty().name())),
+                None => fail(format!("unknown function '{name}'")),
+            };
         }
 
         let mut values = Vec::with_capacity(args.len());
@@ -1832,6 +1870,68 @@ impl Evaluator {
             actions,
         };
         (found.run)(self, &mut call)
+    }
+
+    /// Call a user function: its parameters are bound to the arguments while
+    /// its body is evaluated. Names in the body are looked up when it's
+    /// called, so it sees the `let`s and functions there are by then.
+    ///
+    /// The body was parsed from whichever code defined the function, so its
+    /// positions mean nothing in the code being run: errors from inside it
+    /// are reported at the call, with the function's name in front.
+    fn call(
+        &mut self,
+        f: &Function,
+        args: &[Spanned],
+        pos: usize,
+        actions: &mut Vec<Action>,
+    ) -> Result<Value, Error> {
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(self.eval(arg, actions)?);
+        }
+        if values.len() != f.params.len() {
+            return Err(Error {
+                pos,
+                msg: format!(
+                    "{} takes {} argument(s), got {}",
+                    f.name,
+                    f.params.len(),
+                    values.len()
+                ),
+            });
+        }
+        if self.depth >= MAX_CALL_DEPTH {
+            return Err(Error {
+                pos,
+                msg: TOO_DEEP.to_string(),
+            });
+        }
+        let shadowed: Vec<Option<Value>> = f
+            .params
+            .iter()
+            .zip(values)
+            .map(|(param, value)| self.vars.insert(param.clone(), value))
+            .collect();
+        self.depth += 1;
+        let result = self.eval(&f.body, actions);
+        self.depth -= 1;
+        for (param, old) in f.params.iter().zip(shadowed) {
+            match old {
+                Some(value) => self.vars.insert(param.clone(), value),
+                None => self.vars.remove(param),
+            };
+        }
+        result.map_err(|e| {
+            // Runaway recursion gets one name in front (the outermost), not
+            // one per call.
+            let msg = if e.msg == TOO_DEEP && self.depth > 0 {
+                e.msg
+            } else {
+                format!("{}: {}", f.name, e.msg)
+            };
+            Error { pos, msg }
+        })
     }
 
     /// A preset space's impulse response, synthesized on first use.
@@ -2669,5 +2769,83 @@ mod tests {
             panic!()
         };
         assert_eq!(pattern.glide, Some(0.25));
+    }
+
+    #[test]
+    fn functions() {
+        let mut ev = evaluator();
+        let kick = r#"sample("kick.mp3")"#;
+        run(&mut ev, "fn louder(x, by) = x.gain(by)");
+        // Called both ways.
+        let plain = peak(&render_with(&mut ev, &format!("{kick}.play")));
+        let twice = peak(&render_with(&mut ev, &format!("{kick}.louder(2).play")));
+        assert!((twice - 2.0 * plain).abs() < 1e-4);
+        let again = peak(&render_with(&mut ev, &format!("louder({kick}, 2).play")));
+        assert_eq!(again, twice);
+
+        // Holes in the body are holes in what it returns.
+        run(
+            &mut ev,
+            "fn tone(pos) = wavetable(\"basic\", pos, 0, ?note = a4).fit(100ms)",
+        );
+        let a4 = render_with(&mut ev, "tone(0).play");
+        let a5 = render_with(&mut ev, "tone(0).with(note: a5).play");
+        assert!((frequency(&a4) - 440.0).abs() <= 10.0);
+        assert!((frequency(&a5) - 880.0).abs() <= 10.0);
+
+        // Parameters shadow lets for the call only.
+        run(&mut ev, "let x = 3\nfn id(x) = x");
+        run(&mut ev, "let y = id(4)");
+        assert!(matches!(ev.vars["y"], Value::Num(4.0)));
+        assert!(matches!(ev.vars["x"], Value::Num(3.0)));
+        assert!(!ev.vars.contains_key("by"), "no parameter left behind");
+
+        // Names in the body are looked up when it's called.
+        run(
+            &mut ev,
+            "fn amount() = 0.5\nfn quieter(x) = x.gain(amount())",
+        );
+        run(&mut ev, "fn amount() = 0.25");
+        let quarter = peak(&render_with(&mut ev, &format!("{kick}.quieter.play")));
+        assert!((quarter - 0.25 * plain).abs() < 1e-4);
+    }
+
+    #[test]
+    fn function_errors() {
+        let mut ev = evaluator();
+        run(&mut ev, "fn wide(x) = x.spread(\"lots\")");
+        // At the call, not somewhere in the body's (other) code.
+        let src = r#"sample("kick.mp3").wide.play"#;
+        let e = ev.run(&parse(src).unwrap()).err().unwrap();
+        assert_eq!(e.pos, 19);
+        assert_eq!(
+            e.msg,
+            "wide: spread: expected an amount (0 to 1), got a string"
+        );
+        assert_eq!(
+            error_with(&mut ev, r#"sample("kick.mp3").wide(1)"#),
+            "wide takes 1 argument(s), got 2"
+        );
+        assert_eq!(
+            error_with(&mut ev, "fn play(x) = x"),
+            "'play' is already a built-in function"
+        );
+        run(&mut ev, "let n = 1");
+        assert_eq!(
+            error_with(&mut ev, "n(2)"),
+            "'n' is a number, not a function"
+        );
+        run(&mut ev, "fn forever(x) = forever(x)");
+        assert_eq!(
+            error_with(&mut ev, "forever(1)"),
+            "forever: too many calls inside calls (does a function call itself?)"
+        );
+        assert_eq!(
+            error_with(&mut ev, "wide.play"),
+            "play: expected a sound, got a function"
+        );
+        // A failed block leaves no function behind, like a failed let.
+        assert!(ev.run(&parse("fn f() = 1\nnope()").unwrap()).is_err());
+        assert_eq!(error_with(&mut ev, "f()"), "unknown function 'f'");
     }
 }

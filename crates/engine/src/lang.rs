@@ -22,7 +22,11 @@
 //! calls it C3). A frequency like `800hz` or `2khz` is just another way to write
 //! a pitch, the way `-6db` is another way to write an amount. `at 4b` is a grid
 //! to start things on (the next multiple of 4 beats); it binds like a method
-//! call, so `at 5b + 2` is `add(at(5b), 2)`. `let name = ...` names a value, and a bare `name` refers to it.
+//! call, so `at 5b + 2` is `add(at(5b), 2)`.
+//!
+//! `let name = ...` names a value, and a bare `name` refers to it. `fn
+//! name(a, b) = ...` defines a function: one expression, with its parameters
+//! bound to the arguments of each call (so `x.name(b)` works too).
 //! `?name` is a hole to be filled in later, `?name = 0.2` one with a default,
 //! and `name: value` (only in arguments) fills one, as in `lead.with(pos: 0.2)`.
 //!
@@ -51,6 +55,12 @@ pub enum Expr {
     Let {
         name: String,
         value: Box<Spanned>,
+    },
+    /// `fn name(params) = body`, only as a statement.
+    Fn {
+        name: String,
+        params: Vec<String>,
+        body: Box<Spanned>,
     },
     /// `?name` or `?name = default`.
     Hole {
@@ -105,6 +115,7 @@ pub(crate) enum Token {
     Plus,
     Pitch(f64),
     Let,
+    Fn,
     At,
     Question,
     Colon,
@@ -275,6 +286,7 @@ pub(crate) fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                 let tok = match &src[start..i] {
                     "inf" => Token::Num(f64::INFINITY),
                     "let" => Token::Let,
+                    "fn" => Token::Fn,
                     "at" => Token::At,
                     name => match note(name) {
                         Some(note) => Token::Pitch(note),
@@ -316,8 +328,20 @@ impl Parser {
         }
     }
 
-    /// `let name = value`, or an expression.
+    /// A name, for `what` (like "after 'let'").
+    fn name(&mut self, what: &str) -> Result<String, Error> {
+        let Some(Token::Ident(name)) = self.peek().cloned() else {
+            return err(self.pos(), format!("expected a name {what}"));
+        };
+        self.i += 1;
+        Ok(name)
+    }
+
+    /// `let name = value`, `fn name(params) = body`, or an expression.
     fn statement(&mut self) -> Result<Spanned, Error> {
+        if self.peek() == Some(&Token::Fn) {
+            return self.function();
+        }
         if self.peek() != Some(&Token::Let) {
             return self.expr();
         }
@@ -331,6 +355,38 @@ impl Parser {
         let value = Box::new(self.expr()?);
         Ok(Spanned {
             expr: Expr::Let { name, value },
+            pos,
+        })
+    }
+
+    /// `fn name(a, b) = body`. The parameters may end with a comma, like
+    /// arguments.
+    fn function(&mut self) -> Result<Spanned, Error> {
+        let pos = self.pos();
+        self.i += 1;
+        let name = self.name("after 'fn'")?;
+        self.expect(Token::LParen, "'(' and the parameters")?;
+        let mut params = Vec::new();
+        while self.peek() != Some(&Token::RParen) {
+            let param = self.name("for a parameter")?;
+            if params.contains(&param) {
+                return err(
+                    self.tokens[self.i - 1].1,
+                    format!("'{param}' is a parameter twice"),
+                );
+            }
+            params.push(param);
+            match self.peek() {
+                Some(Token::Comma) => self.i += 1,
+                Some(Token::RParen) => {}
+                _ => return err(self.pos(), "expected ',' or ')'"),
+            }
+        }
+        self.i += 1;
+        self.expect(Token::Equals, "'='")?;
+        let body = Box::new(self.expr()?);
+        Ok(Spanned {
+            expr: Expr::Fn { name, params, body },
             pos,
         })
     }
@@ -541,6 +597,9 @@ mod tests {
                 Expr::Pitch(note) => format!("note{note}"),
                 Expr::Var(name) => name.clone(),
                 Expr::Let { name, value } => format!("let {name} = {}", show(&value.expr)),
+                Expr::Fn { name, params, body } => {
+                    format!("fn {name}({}) = {}", params.join(", "), show(&body.expr))
+                }
                 Expr::Hole { name, default } => match default {
                     Some(d) => format!("?{name}={}", show(&d.expr)),
                     None => format!("?{name}"),
@@ -673,6 +732,35 @@ mod tests {
             parse("x.play(at)").unwrap_err().msg,
             "expected an expression"
         );
+    }
+
+    #[test]
+    fn functions() {
+        assert_eq!(
+            desugar("fn wide(x, amount) = x.spread(amount).pan(-1)"),
+            "fn wide(x, amount) = pan(spread(x, amount), -1)"
+        );
+        assert_eq!(desugar("fn f(\n  x,\n) = x"), "fn f(x) = x");
+        assert_eq!(desugar("fn f() = g()"), "fn f() = g()");
+        assert_eq!(
+            parse("fn = 1").unwrap_err().msg,
+            "expected a name after 'fn'"
+        );
+        assert_eq!(
+            parse("fn f = 1").unwrap_err().msg,
+            "expected '(' and the parameters"
+        );
+        assert_eq!(parse("fn f(x) x").unwrap_err().msg, "expected '='");
+        assert_eq!(
+            parse("fn f(1) = 1").unwrap_err().msg,
+            "expected a name for a parameter"
+        );
+        assert_eq!(
+            parse("fn f(x, x) = x").unwrap_err().msg,
+            "'x' is a parameter twice"
+        );
+        // Only a statement, like let.
+        assert!(parse("g(fn f() = 1)").is_err());
     }
 
     #[test]
