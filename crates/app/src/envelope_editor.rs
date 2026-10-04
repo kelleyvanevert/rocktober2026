@@ -11,13 +11,13 @@
 //! straighten it.
 
 use std::cell::Cell;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use rocktober_engine::bundle::Bundle;
 use rocktober_engine::envelope::{Envelope, Stage};
 use rocktober_engine::resource::ResourceKind;
 
@@ -65,7 +65,8 @@ struct Drag {
 
 pub struct EnvelopeEditor {
     name: String,
-    path: PathBuf,
+    /// The `.rock` file's resources, where the envelope is read from and saved to.
+    bundle: Bundle,
     state: State,
     drag: Option<Drag>,
     hover: Option<Handle>,
@@ -219,20 +220,17 @@ fn format_level(level: f64) -> String {
 }
 
 impl EnvelopeEditor {
-    /// `root` is the folder of the code file.
-    pub fn new(name: &str, root: &Path) -> Self {
-        let path = ResourceKind::Envelope.path(root, name);
-        let state = if path.exists() {
-            match Envelope::load(&path) {
+    pub fn new(name: &str, bundle: Bundle) -> Self {
+        let state = match bundle.get(ResourceKind::Envelope, name) {
+            Some(entry) => match Envelope::from_json(name, &entry.data) {
                 Ok(env) => State::Loaded(env),
                 Err(e) => State::Failed(e),
-            }
-        } else {
-            State::Missing
+            },
+            None => State::Missing,
         };
         Self {
             name: name.to_string(),
-            path,
+            bundle,
             state,
             drag: None,
             hover: None,
@@ -250,27 +248,22 @@ impl EnvelopeEditor {
 
     pub fn create(&mut self, cx: &mut Context<Self>) {
         self.state = State::Loaded(Envelope::default());
-        if self.save(cx) {
-            cx.emit(ResourceEvent::Info(format!(
-                "created {}/{}",
-                ResourceKind::Envelope.dir(),
-                ResourceKind::Envelope.file_name(&self.name)
-            )));
-        }
+        self.save(cx);
+        cx.emit(ResourceEvent::Info(format!(
+            "created {}",
+            ResourceKind::Envelope.bundle_path(&self.name)
+        )));
         cx.notify();
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) -> bool {
+    /// Into the bundle; the `.rock` file is written when it's saved.
+    fn save(&mut self, cx: &mut Context<Self>) {
         let State::Loaded(env) = &self.state else {
-            return false;
+            return;
         };
-        match env.save(&self.path) {
-            Ok(()) => true,
-            Err(e) => {
-                cx.emit(ResourceEvent::Error(e));
-                false
-            }
-        }
+        self.bundle
+            .put(ResourceKind::Envelope, &self.name, env.to_json());
+        cx.emit(ResourceEvent::Changed);
     }
 
     fn mouse_down(&mut self, e: &MouseDownEvent, cx: &mut Context<Self>) {
@@ -517,11 +510,7 @@ impl Render for EnvelopeEditor {
                 .child(e.clone())
                 .into_any_element(),
             State::Missing => {
-                let file = format!(
-                    "{}/{}",
-                    ResourceKind::Envelope.dir(),
-                    ResourceKind::Envelope.file_name(&self.name)
-                );
+                let file = ResourceKind::Envelope.bundle_path(&self.name);
                 let this = cx.entity().downgrade();
                 curve_view::missing(
                     file,

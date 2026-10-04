@@ -1,11 +1,9 @@
 //! A modulation: one value (0..1) drawn over a fixed length of time, like an
 //! Ableton clip envelope. Stored as `modulations/<name>.json`.
 
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
 
-use crate::curve::{self, load_json, save_json};
+use crate::curve;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Modulation {
@@ -50,17 +48,18 @@ impl Default for Modulation {
 impl Modulation {
     pub const MIN_LENGTH: f64 = 0.001;
 
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let mut modulation: Self = load_json(path)?;
+    /// Read a JSON file's contents; `name` is for messages.
+    pub fn from_json(name: &str, data: &[u8]) -> Result<Self, String> {
+        let mut modulation: Self = curve::from_json(name, data)?;
         if modulation.points.is_empty() {
-            return Err(format!("{}: a modulation needs points", path.display()));
+            return Err(format!("{name}: a modulation needs points"));
         }
         modulation.normalize();
         Ok(modulation)
     }
 
-    pub fn save(&self, path: &Path) -> Result<(), String> {
-        save_json(self, path)
+    pub fn to_json(&self) -> Vec<u8> {
+        curve::to_json(self)
     }
 
     /// Clamp everything into range and sort the points.
@@ -147,19 +146,14 @@ mod tests {
 
     #[test]
     fn round_trips_through_json() {
-        let dir = std::env::temp_dir().join(format!("rocktober-mod-{}", std::process::id()));
-        let path = dir.join("modulations/sweep.json");
         let m = Modulation::default();
-        m.save(&path).unwrap();
-        assert_eq!(Modulation::load(&path).unwrap(), m);
+        assert_eq!(Modulation::from_json("sweep", &m.to_json()).unwrap(), m);
         // Hand-written files may leave out curves and be out of order.
-        std::fs::write(
-            &path,
-            r#"{"length": 4, "points": [{"at": 1, "value": 2}, {"at": 0, "value": 0}]}"#,
+        let loaded = Modulation::from_json(
+            "sweep",
+            br#"{"length": 4, "points": [{"at": 1, "value": 2}, {"at": 0, "value": 0}]}"#,
         )
         .unwrap();
-        let loaded = Modulation::load(&path).unwrap();
         assert_eq!(loaded.points, [Point::new(0.0, 0.0), Point::new(1.0, 1.0)]);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

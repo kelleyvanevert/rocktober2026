@@ -151,19 +151,13 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bundle::Bundle;
     use crate::eval::Evaluator;
     use crate::lang::parse;
-    use crate::resource::Resources;
 
     /// An instrument (a wavetable with a `?note` hole) and a scheduler.
     fn setup() -> (Sound, Scheduler) {
-        let mut ev = Evaluator::new(
-            48_000,
-            Resources {
-                root: ".".into(),
-                sample_dirs: vec![],
-            },
-        );
+        let mut ev = Evaluator::new(48_000, Bundle::default());
         let src = r#"notes("c4", 1b).play(wavetable("basic", 0, 0, ?note))"#;
         let actions = ev.run(&parse(src).unwrap()).unwrap();
         let Some(crate::eval::Action::Pattern { instrument, .. }) = actions.into_iter().next()

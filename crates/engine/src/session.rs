@@ -14,12 +14,12 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 use rtrb::Producer;
 
+use crate::bundle::Bundle;
 use crate::engine::{Command, Engine, MAX_BLOCK, Slot, Status};
 use crate::eval::{self, Action, Evaluator};
 use crate::lang;
 use crate::nodes::{Frame, Node};
 use crate::recorder::Recording;
-use crate::resource::Resources;
 use crate::scheduler::{self, Scheduler};
 
 pub struct Session {
@@ -112,7 +112,7 @@ enum Output {
 
 impl Session {
     /// Open the default output device and start the audio thread.
-    pub fn start(resources: Resources) -> Result<Self, String> {
+    pub fn start(bundle: Bundle) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or("no output device")?;
         let supported = device.default_output_config().map_err(|e| e.to_string())?;
@@ -157,7 +157,7 @@ impl Session {
             channels: config.channels,
             shared,
             status,
-            evaluator: Evaluator::new(config.sample_rate, resources),
+            evaluator: Evaluator::new(config.sample_rate, bundle),
             recording: None,
             _output: Output::Device(stream),
         })
@@ -166,7 +166,7 @@ impl Session {
     /// A session that evaluates code but plays nothing, for tests. Commands are
     /// queued but never consumed, and patterns never advance, so don't call
     /// `wait_until_idle` on it.
-    pub fn without_output(sample_rate: u32, resources: Resources) -> Self {
+    pub fn without_output(sample_rate: u32, bundle: Bundle) -> Self {
         let (commands, commands_rx) = rtrb::RingBuffer::<Command>::new(1024);
         let (garbage_tx, _) = rtrb::RingBuffer::<Box<dyn Node>>::new(1);
         let status = Arc::new(Status::default());
@@ -177,7 +177,7 @@ impl Session {
             channels: 2,
             shared: Shared::new(commands, sample_rate),
             status,
-            evaluator: Evaluator::new(sample_rate, resources),
+            evaluator: Evaluator::new(sample_rate, bundle),
             recording: None,
             _output: Output::None(engine),
         }
@@ -249,9 +249,9 @@ impl Session {
         (clock.bpm(), clock.beat_at(now))
     }
 
-    /// Where the code's samples, envelopes, ... are.
-    pub fn resources(&self) -> &Resources {
-        self.evaluator.resources()
+    /// The resources in the `.rock` file: its samples, envelopes, ...
+    pub fn bundle(&self) -> &Bundle {
+        self.evaluator.bundle()
     }
 
     /// Fade out everything that's playing, and stop all patterns.
@@ -370,12 +370,7 @@ mod tests {
 
     #[test]
     fn eval_drives_the_clock_and_patterns() {
-        let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples");
-        let resources = Resources {
-            root: samples.clone(),
-            sample_dirs: vec![samples],
-        };
-        let mut session = Session::without_output(48_000, resources);
+        let mut session = Session::without_output(48_000, Bundle::with_kick());
         assert_eq!(session.position(), (120.0, 0.0));
         session.eval("140.bpm").unwrap();
         assert_eq!(session.position().0, 140.0);
@@ -407,12 +402,7 @@ mod tests {
     /// the scheduler's work with rendering blocks, as the two threads would.
     #[test]
     fn pattern_hits_land_on_their_frames() {
-        let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples");
-        let resources = Resources {
-            root: samples.clone(),
-            sample_dirs: vec![samples],
-        };
-        let mut session = Session::without_output(48_000, resources);
+        let mut session = Session::without_output(48_000, Bundle::with_kick());
         // A hit every beat (24000 frames at 120 bpm), from the first bar line
         // after the lookahead: beat 4.
         session

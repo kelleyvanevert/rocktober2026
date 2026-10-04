@@ -1,8 +1,6 @@
 //! What envelopes and modulations have in common: curved segments, and being
 //! stored as small JSON files.
 
-use std::path::Path;
-
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -26,19 +24,15 @@ pub fn segment(from: f64, to: f64, u: f64, curve: f64) -> f64 {
     from + (to - from) * bend(u.clamp(0.0, 1.0), curve)
 }
 
-pub(crate) fn load_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+/// Read a JSON file's contents; `name` is for messages.
+pub(crate) fn from_json<T: DeserializeOwned>(name: &str, data: &[u8]) -> Result<T, String> {
+    serde_json::from_slice(data).map_err(|e| format!("{name}: {e}"))
 }
 
-pub(crate) fn save_json<T: Serialize>(value: &T, path: &Path) -> Result<(), String> {
-    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| fail(&e))?;
-    }
-    let mut text = serde_json::to_string_pretty(value).map_err(|e| fail(&e))?;
+pub(crate) fn to_json<T: Serialize>(value: &T) -> Vec<u8> {
+    let mut text = serde_json::to_string_pretty(value).expect("plain data serializes");
     text.push('\n');
-    std::fs::write(path, text).map_err(|e| fail(&e))
+    text.into_bytes()
 }
 
 #[cfg(test)]

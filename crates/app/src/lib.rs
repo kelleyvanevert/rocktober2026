@@ -9,10 +9,12 @@ pub mod workspace;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 
-/// Something a resource editor did that's worth a line in the console.
+/// Something a resource editor did: worth a line in the console, or a change
+/// to the resources, which makes the `.rock` file need saving.
 pub enum ResourceEvent {
     Info(String),
     Error(String),
+    Changed,
 }
 
 actions!(

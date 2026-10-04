@@ -20,9 +20,10 @@ mod macos {
     use gpui_kit::*;
     use rocktober::workspace::Workspace;
     use rocktober_engine::Session;
+    use rocktober_engine::bundle::{self, Bundle};
     use rocktober_engine::envelope::Envelope;
     use rocktober_engine::modulation::Modulation;
-    use rocktober_engine::resource::Resources;
+    use rocktober_engine::resource::ResourceKind;
 
     struct Harness {
         // Fields drop in order: the entity handle must go before the app context,
@@ -30,6 +31,8 @@ mod macos {
         workspace: Entity<Workspace>,
         window: AnyWindowHandle,
         out: PathBuf,
+        /// Where cmd-s saves to.
+        path: PathBuf,
         cx: HeadlessAppContext,
     }
 
@@ -54,11 +57,9 @@ mod macos {
 
             // A path that doesn't exist, so the workspace starts with its example code.
             let path = out.join("untitled.rock");
-            let resources = Resources {
-                root: out.clone(),
-                sample_dirs: vec![root.join("samples")],
-            };
-            let session = Session::without_output(48_000, resources);
+            let _ = std::fs::remove_file(&path);
+            let bundle = Bundle::with_kick();
+            let session = Session::without_output(48_000, bundle.clone());
             let (window, workspace) = cx
                 .update(|cx| {
                     let options = WindowOptions {
@@ -69,8 +70,9 @@ mod macos {
                         show: false,
                         ..Default::default()
                     };
+                    let path = path.clone();
                     gpui_kit::open_window(options, cx, |window, cx| {
-                        cx.new(|cx| Workspace::new(path, Ok(session), window, cx))
+                        cx.new(|cx| Workspace::new(path, Ok(None), bundle, Ok(session), window, cx))
                     })
                 })
                 .unwrap();
@@ -79,6 +81,7 @@ mod macos {
                 window,
                 workspace,
                 out,
+                path,
             }
         }
 
@@ -159,6 +162,46 @@ mod macos {
                     workspace.update(cx, |workspace, cx| workspace.set_text(text, window, cx))
                 })
                 .unwrap();
+        }
+
+        /// Drop a file from the Finder onto the element `id`, and let loading
+        /// it finish.
+        fn drop_file(&mut self, id: &'static str, path: PathBuf) {
+            let position = self.bounds_of(id).center();
+            // Like the OS does it: the mouse is over the window (hover is
+            // ignored right after typing), the files enter it, move over the
+            // target, and are dropped.
+            self.with_window(|window, cx| window.simulate_mouse_move(position, cx));
+            let paths = ExternalPaths([path].into_iter().collect());
+            for event in [
+                FileDropEvent::Entered { position, paths },
+                FileDropEvent::Pending { position },
+                FileDropEvent::Submit { position },
+            ] {
+                self.with_window(|window, cx| {
+                    window.dispatch_event(PlatformInput::FileDrop(event), cx);
+                });
+            }
+            self.cx.run_until_parked();
+        }
+
+        fn dirty(&mut self) -> bool {
+            self.cx.update(|cx| self.workspace.read(cx).is_dirty())
+        }
+
+        fn bundle(&mut self) -> Bundle {
+            self.cx
+                .update(|cx| self.workspace.read(cx).bundle().clone())
+        }
+
+        fn envelope(&mut self, name: &str) -> Envelope {
+            let entry = self.bundle().get(ResourceKind::Envelope, name).unwrap();
+            Envelope::from_json(name, &entry.data).unwrap()
+        }
+
+        fn modulation(&mut self, name: &str) -> Modulation {
+            let entry = self.bundle().get(ResourceKind::Modulation, name).unwrap();
+            Modulation::from_json(name, &entry.data).unwrap()
         }
 
         fn last_log(&mut self) -> String {
@@ -250,17 +293,33 @@ mod macos {
         h.move_to(1, 0);
         assert_eq!(h.resource(), None);
 
+        // Samples only come from the file itself; a missing one can be dropped in.
+        h.set_text("sample(\"dropped.mp3\").play\n");
+        h.press_at(0, 0, "cmd-enter");
+        assert_eq!(
+            h.last_log(),
+            "1:8: sample: \"dropped.mp3\" isn't in this file yet: put the cursor on it to add it"
+        );
+        h.move_to(0, 3);
+        assert_eq!(h.resource(), Some(("dropped.mp3".into(), false)));
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        h.drop_file("drop", manifest.join("Cargo.toml"));
+        assert_eq!(h.last_log(), "dropped.mp3 needs a .mp3 file");
+        assert!(!h.dirty());
+        h.drop_file("drop", manifest.join("../engine/assets/kick.mp3"));
+        assert_eq!(h.last_log(), "added samples/dropped.mp3");
+        assert_eq!(h.resource(), Some(("dropped.mp3".into(), true)));
+        assert!(h.dirty());
+        h.press_at(0, 0, "cmd-enter");
+        assert_eq!(h.last_log(), "sample(\"dropped.mp3\").play");
+        h.snapshot("6b-dropped-sample");
+
         // A missing envelope can be created, then edited by dragging.
-        let envelopes = h.out.join("envelopes");
-        let modulations = h.out.join("modulations");
-        let _ = std::fs::remove_dir_all(&envelopes);
-        let _ = std::fs::remove_dir_all(&modulations);
         h.set_text("envelope(\"pluck\")\n\nmodulation(\"sweep\")\n");
         h.move_to(0, 3);
         h.snapshot("7-missing-envelope");
         h.with_window(|window, cx| window.click("create", cx));
-        let pluck = envelopes.join("pluck.json");
-        assert_eq!(Envelope::load(&pluck).unwrap(), Envelope::default());
+        assert_eq!(h.envelope("pluck"), Envelope::default());
 
         // Drag the end of the release 40 pixels to the right. (This repeats the
         // editor's layout: an 8px inset, 20% of the width for the sustain, and
@@ -277,7 +336,7 @@ mod macos {
                 cx,
             )
         });
-        let release = Envelope::load(&pluck).unwrap().release.time;
+        let release = h.envelope("pluck").release.time;
         let expected = 0.6 + 40.0 / pixels_per_second as f64;
         assert!(
             (release - expected).abs() < 0.005,
@@ -288,16 +347,32 @@ mod macos {
         // Same for a modulation; clicking adds a point.
         h.move_to(2, 3);
         h.with_window(|window, cx| window.click("create", cx));
-        let sweep = modulations.join("sweep.json");
-        assert_eq!(Modulation::load(&sweep).unwrap(), Modulation::default());
+        assert_eq!(h.modulation("sweep"), Modulation::default());
         let b = h.bounds_of("modulation-curve");
         let center = b.center();
         h.with_window(|window, cx| window.drag(center, center + point(px(0.), px(-30.)), cx));
-        let m = Modulation::load(&sweep).unwrap();
+        let m = h.modulation("sweep");
         assert_eq!(m.points.len(), 3);
         assert!((m.points[1].at - 0.5).abs() < 0.01);
         assert!(m.points[1].value > 0.6, "{:?}", m.points[1]);
         h.snapshot("9-modulation");
+
+        // cmd-s writes the code and the resources into one .rock file.
+        h.press_at(0, 0, "cmd-s");
+        assert_eq!(h.last_log(), format!("saved {}", h.path.display()));
+        let (code, saved) = bundle::open(&h.path).unwrap().unwrap();
+        assert_eq!(code, h.text());
+        assert_eq!(
+            saved.paths(),
+            [
+                "envelopes/pluck.json",
+                "modulations/sweep.json",
+                "samples/dropped.mp3",
+                "samples/kick.mp3",
+            ]
+        );
+        let entry = saved.get(ResourceKind::Modulation, "sweep").unwrap();
+        assert_eq!(Modulation::from_json("sweep", &entry.data).unwrap(), m);
 
         println!("ui: passed");
     }

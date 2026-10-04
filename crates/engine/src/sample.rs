@@ -1,13 +1,15 @@
 //! Decoding audio files into memory (application thread only).
 
 use std::fs::File;
-use std::path::Path;
+use std::io::Cursor;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Time;
 
@@ -21,20 +23,55 @@ const EDGE_FADE_SECONDS: f64 = 0.003;
 /// first output is silence or garbage; we decode and drop this much first.
 const SEEK_PREROLL_SECONDS: f64 = 0.5;
 
+/// Where audio is read from: a file, or a file's contents (from a `.rock` file).
+#[derive(Clone, Debug)]
+pub enum Source {
+    File(PathBuf),
+    /// `name` is for messages, and its extension tells the decoder the format.
+    Memory {
+        name: String,
+        data: Arc<[u8]>,
+    },
+}
+
+impl Source {
+    /// What to call it in messages.
+    pub fn name(&self) -> String {
+        match self {
+            Source::File(path) => path.display().to_string(),
+            Source::Memory { name, .. } => name.clone(),
+        }
+    }
+
+    fn extension(&self) -> Option<&str> {
+        match self {
+            Source::File(path) => path.extension().and_then(|e| e.to_str()),
+            Source::Memory { name, .. } => name.rsplit_once('.').map(|(_, ext)| ext),
+        }
+    }
+
+    fn open(&self) -> std::io::Result<Box<dyn MediaSource>> {
+        Ok(match self {
+            Source::File(path) => Box::new(File::open(path)?),
+            Source::Memory { data, .. } => Box::new(Cursor::new(data.clone())),
+        })
+    }
+}
+
 /// Decode a whole file to stereo f32 frames. Mono is duplicated to both sides;
 /// beyond two channels, only the first two are kept.
-pub fn load(path: &Path) -> Result<SampleData, String> {
-    load_range(path, 0.0, None)
+pub fn load(source: &Source) -> Result<SampleData, String> {
+    load_range(source, 0.0, None)
 }
 
 /// Decode only `start..end` seconds of a file (`end: None` means to the end of
 /// the file). The decoder seeks to `start` instead of decoding everything before
 /// it, so a short window of a long recording is fast and small. Edges that cut
 /// into the audio get a short fade.
-pub fn load_range(path: &Path, start: f64, end: Option<f64>) -> Result<SampleData, String> {
-    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+pub fn load_range(source: &Source, start: f64, end: Option<f64>) -> Result<SampleData, String> {
+    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", source.name());
     let mut frames: Vec<Frame> = Vec::new();
-    let (sample_rate, cut_end) = decode(path, start, end, |frame| frames.push(frame))?;
+    let (sample_rate, cut_end) = decode(source, start, end, |frame| frames.push(frame))?;
 
     if frames.is_empty() {
         return Err(match (start, end) {
@@ -89,12 +126,12 @@ impl Overview {
 
 /// Summarize a file for drawing. It's decoded as a stream, so even an hour-long
 /// recording never needs to be in memory as a whole.
-pub fn overview(path: &Path) -> Result<Overview, String> {
+pub fn overview(source: &Source) -> Result<Overview, String> {
     let mut peaks = Vec::new();
     let mut frames = 0;
     let empty = (f32::MAX, f32::MIN);
     let mut peak = empty;
-    let (sample_rate, _) = decode(path, 0.0, None, |[l, r]| {
+    let (sample_rate, _) = decode(source, 0.0, None, |[l, r]| {
         peak = (peak.0.min(l.min(r)), peak.1.max(l.max(r)));
         frames += 1;
         if frames % OVERVIEW_BLOCK == 0 {
@@ -103,7 +140,7 @@ pub fn overview(path: &Path) -> Result<Overview, String> {
         }
     })?;
     if frames == 0 {
-        return Err(format!("{}: file contains no audio", path.display()));
+        return Err(format!("{}: file contains no audio", source.name()));
     }
     if frames % OVERVIEW_BLOCK != 0 {
         peaks.push(peak);
@@ -119,17 +156,17 @@ pub fn overview(path: &Path) -> Result<Overview, String> {
 /// Returns the sample rate and whether decoding stopped at `end` (rather than
 /// at the end of the file). Mono is duplicated to both sides.
 fn decode(
-    path: &Path,
+    source: &Source,
     start: f64,
     end: Option<f64>,
     mut emit: impl FnMut(Frame),
 ) -> Result<(u32, bool), String> {
-    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", source.name());
 
-    let file = File::open(path).map_err(|e| fail(&e))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let media = source.open().map_err(|e| fail(&e))?;
+    let mss = MediaSourceStream::new(media, Default::default());
     let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+    if let Some(ext) = source.extension() {
         hint.with_extension(ext);
     }
 
@@ -230,9 +267,9 @@ mod tests {
 
     #[test]
     fn overview_matches_the_decoded_file() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples/kick.mp3");
-        let data = load(&path).unwrap();
-        let overview = overview(&path).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/kick.mp3");
+        let data = load(&Source::File(path.clone())).unwrap();
+        let overview = overview(&Source::File(path.clone())).unwrap();
         assert_eq!(overview.frames, data.frames.len());
         assert_eq!(overview.sample_rate, data.sample_rate);
         assert_eq!(
@@ -242,5 +279,12 @@ mod tests {
         let lowest = data.frames.iter().flatten().fold(0f32, |m, s| m.min(*s));
         let low = overview.peaks.iter().fold(0f32, |m, p| m.min(p.0));
         assert_eq!(low, lowest);
+
+        // The same, from memory.
+        let source = Source::Memory {
+            name: "kick.mp3".into(),
+            data: std::fs::read(path).unwrap().into(),
+        };
+        assert_eq!(load(&source).unwrap().frames, data.frames);
     }
 }

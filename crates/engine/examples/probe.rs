@@ -3,7 +3,7 @@
 fn main() {
     let path = std::env::args().nth(1).expect("usage: probe <file>");
     let start = std::time::Instant::now();
-    match rocktober_engine::sample::load(path.as_ref()) {
+    match rocktober_engine::sample::load(&rocktober_engine::sample::Source::File(path.into())) {
         Ok(data) => {
             let seconds = data.frames.len() as f64 / data.sample_rate as f64;
             let peak = data

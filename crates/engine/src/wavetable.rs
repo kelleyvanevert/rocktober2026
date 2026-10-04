@@ -10,7 +10,6 @@
 //!
 //! Tables are built on the application thread; the oscillator only reads them.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use realfft::RealFftPlanner;
@@ -138,13 +137,13 @@ impl Wavetable {
     }
 
     /// Load a WAV file of back-to-back `SIZE`-sample cycles (Serum's format).
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let data = sample::load(path)?;
+    pub fn load(source: &sample::Source) -> Result<Self, String> {
+        let data = sample::load(source)?;
         let mono: Vec<f32> = data.frames.iter().map(|[l, r]| (l + r) / 2.0).collect();
         if mono.len() < SIZE {
             return Err(format!(
                 "{}: a wavetable needs cycles of {SIZE} samples, this has only {}",
-                path.display(),
+                source.name(),
                 mono.len()
             ));
         }

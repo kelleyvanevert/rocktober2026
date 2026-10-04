@@ -1,7 +1,0 @@
-{
-  "length": 0.5,
-  "points": [
-    { "at": 0.0, "value": 1.0, "curve": -0.6 },
-    { "at": 1.0, "value": 0.0, "curve": 0.0 }
-  ]
-}

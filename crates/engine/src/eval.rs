@@ -18,9 +18,9 @@
 //! filled in several ways; nothing is instantiated until `play`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
+use crate::bundle::Bundle;
 use crate::clock::Clock;
 use crate::control::{self, Combine, ControlNode, EnvelopePlayer, ModulationPlayer, Param};
 use crate::envelope::Envelope;
@@ -30,7 +30,7 @@ use crate::nodes::{
     Add, Delay, Fit, Gain, Limit, Multiply, Node, Repeat, SampleData, Sampler, Seq, Slice,
 };
 use crate::pattern::Pattern;
-use crate::resource::{self, ResourceKind, Resources};
+use crate::resource::ResourceKind;
 use crate::reverb::{self, Impulse, MAX_IR_SECONDS, Reverb};
 use crate::sample;
 use crate::wavetable::{self, Oscillator, Wavetable};
@@ -838,7 +838,7 @@ fn builtins() -> Vec<Builtin> {
             }
             match ev.load(c.args[0].str(), start, end) {
                 Ok(data) => sound(Sound::Sample(data)),
-                Err(msg) => Err(Error { pos: c.pos, msg }),
+                Err(msg) => Err(c.fail(0, msg)),
             }
         }),
         builtin(
@@ -1129,15 +1129,16 @@ type Window = (u64, Option<u64>);
 
 pub struct Evaluator {
     sample_rate: u32,
-    resources: Resources,
-    /// Decoded samples, so each file is only loaded once. Holding an `Arc` here
-    /// also guarantees the last reference to a sample is never dropped on the
-    /// audio thread.
-    cache: HashMap<(PathBuf, Window), Arc<SampleData>>,
+    /// The resources in the `.rock` file.
+    bundle: Bundle,
+    /// Decoded samples, by where they're from (see `Evaluator::load`), so each
+    /// is only decoded once. Holding an `Arc` here also guarantees the last
+    /// reference to a sample is never dropped on the audio thread.
+    cache: HashMap<(String, Window), Arc<SampleData>>,
     /// Prepared preset impulse responses, by name.
     spaces: HashMap<String, Arc<Impulse>>,
-    /// Wavetables by name (built-in) or path and modification time (files).
-    /// Like samples, they're kept so they're never freed on the audio thread.
+    /// Wavetables by name (built-in) or name and version (in the bundle). Like
+    /// samples, they're kept so they're never freed on the audio thread.
     wavetables: HashMap<String, Arc<Wavetable>>,
     /// The tempo, for beats in durations.
     bpm: f64,
@@ -1147,10 +1148,10 @@ pub struct Evaluator {
 }
 
 impl Evaluator {
-    pub fn new(sample_rate: u32, resources: Resources) -> Self {
+    pub fn new(sample_rate: u32, bundle: Bundle) -> Self {
         Self {
             sample_rate,
-            resources,
+            bundle,
             cache: HashMap::new(),
             spaces: HashMap::new(),
             wavetables: HashMap::new(),
@@ -1159,8 +1160,8 @@ impl Evaluator {
         }
     }
 
-    pub fn resources(&self) -> &Resources {
-        &self.resources
+    pub fn bundle(&self) -> &Bundle {
+        &self.bundle
     }
 
     /// Evaluate a program, returning the commands it wants sent to the audio thread.
@@ -1322,46 +1323,45 @@ impl Evaluator {
         start: f64,
         end: Option<f64>,
     ) -> Result<Arc<SampleData>, String> {
-        let dirs = &self.resources.sample_dirs;
-        let path = resource::find(dirs, name)
-            .ok_or_else(|| format!("sample '{name}' not found in {dirs:?}"))?;
-        let key = (path, (start.to_bits(), end.map(f64::to_bits)));
+        let (id, source) = sample_source(&self.bundle, name).ok_or_else(|| {
+            format!("\"{name}\" isn't in this file yet: put the cursor on it to add it")
+        })?;
+        let key = (id, (start.to_bits(), end.map(f64::to_bits)));
         if let Some(data) = self.cache.get(&key) {
             return Ok(data.clone());
         }
-        let data = Arc::new(sample::load_range(&key.0, start, end)?);
+        let data = Arc::new(sample::load_range(&source, start, end)?);
         self.cache.insert(key, data.clone());
         Ok(data)
     }
 
-    /// The path of an envelope or modulation file, if it exists. (These are
-    /// read fresh every time, so edits apply the next time the code runs.)
-    fn resource_path(&self, kind: ResourceKind, name: &str) -> Result<PathBuf, String> {
-        let path = kind.path(&self.resources.root, name);
-        if path.is_file() {
-            Ok(path)
-        } else {
-            Err(format!(
-                "\"{name}\" doesn't exist yet ({}/{}): put the cursor on it to create it",
-                kind.dir(),
-                kind.file_name(name)
-            ))
+    /// An envelope or modulation file's contents. (These are read fresh every
+    /// time, so edits apply the next time the code runs.)
+    fn resource_data(&self, kind: ResourceKind, name: &str) -> Result<Arc<[u8]>, String> {
+        match self.bundle.get(kind, name) {
+            Some(entry) => Ok(entry.data),
+            None => Err(format!(
+                "\"{name}\" doesn't exist yet ({}): put the cursor on it to create it",
+                kind.bundle_path(name)
+            )),
         }
     }
 
-    /// A built-in wavetable, or one from `wavetables/`.
+    /// A built-in wavetable, or one from the bundle's `wavetables/`.
     fn wavetable(&mut self, name: &str) -> Result<Arc<Wavetable>, String> {
-        let path = ResourceKind::Wavetable.path(&self.resources.root, name);
-        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        let key = match modified {
-            Some(time) => format!("{}@{time:?}", path.display()),
+        let entry = self.bundle.get(ResourceKind::Wavetable, name);
+        let key = match &entry {
+            Some(entry) => format!("{name}#{}", entry.version),
             None => name.to_string(),
         };
         if let Some(table) = self.wavetables.get(&key) {
             return Ok(table.clone());
         }
-        let table = match modified {
-            Some(_) => Wavetable::load(&path)?,
+        let table = match entry {
+            Some(entry) => Wavetable::load(&sample::Source::Memory {
+                name: ResourceKind::Wavetable.file_name(name),
+                data: entry.data,
+            })?,
             None => Wavetable::builtin(name).ok_or_else(|| {
                 format!(
                     "unknown wavetable \"{name}\" (try {}, or add {}/{})",
@@ -1377,12 +1377,24 @@ impl Evaluator {
     }
 
     fn load_envelope(&self, name: &str) -> Result<Envelope, String> {
-        Envelope::load(&self.resource_path(ResourceKind::Envelope, name)?)
+        Envelope::from_json(name, &self.resource_data(ResourceKind::Envelope, name)?)
     }
 
     fn load_modulation(&self, name: &str) -> Result<Modulation, String> {
-        Modulation::load(&self.resource_path(ResourceKind::Modulation, name)?)
+        Modulation::from_json(name, &self.resource_data(ResourceKind::Modulation, name)?)
     }
+}
+
+/// Where `sample(name)` reads from, if it's in the bundle, and an id for
+/// caching what was decoded, which changes when the sample does.
+pub fn sample_source(bundle: &Bundle, name: &str) -> Option<(String, sample::Source)> {
+    let entry = bundle.get(ResourceKind::Sample, name)?;
+    let id = format!("{name}#{}", entry.version);
+    let source = sample::Source::Memory {
+        name: name.to_string(),
+        data: entry.data,
+    };
+    Some((id, source))
 }
 
 #[cfg(test)]
@@ -1393,63 +1405,42 @@ mod tests {
     use crate::modulation::Point;
     use crate::nodes::Frame;
 
-    fn samples() -> PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples")
-    }
-
     fn evaluator() -> Evaluator {
-        Evaluator::new(
-            48_000,
-            Resources {
-                root: samples(),
-                sample_dirs: vec![samples()],
-            },
-        )
+        Evaluator::new(48_000, Bundle::with_kick())
     }
 
-    /// An evaluator whose code folder has a `slow` envelope (1 s attack, 1 s
+    /// An evaluator whose `.rock` file has a `slow` envelope (1 s attack, 1 s
     /// release, straight lines), a `ramp` modulation (0 to 1 over 1 s), and a
     /// sample `ones.wav` (a second of 1.0).
-    fn with_resources() -> (Evaluator, PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "rocktober-eval-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+    fn with_resources() -> Evaluator {
+        let bundle = Bundle::default();
         let line = |time| Stage { time, curve: 0.0 };
-        Envelope {
+        let slow = Envelope {
             attack: line(1.0),
             decay: line(0.0),
             sustain: 1.0,
             release: line(1.0),
-        }
-        .save(&ResourceKind::Envelope.path(&root, "slow"))
-        .unwrap();
-        Modulation {
+        };
+        bundle.put(ResourceKind::Envelope, "slow", slow.to_json());
+        let ramp = Modulation {
             length: 1.0,
             points: vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)],
-        }
-        .save(&ResourceKind::Modulation.path(&root, "ramp"))
-        .unwrap();
+        };
+        bundle.put(ResourceKind::Modulation, "ramp", ramp.to_json());
         let spec = hound::WavSpec {
             channels: 2,
             sample_rate: 48_000,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
         };
-        let mut wav = hound::WavWriter::create(root.join("ones.wav"), spec).unwrap();
+        let mut wav = Vec::new();
+        let mut writer = hound::WavWriter::new(std::io::Cursor::new(&mut wav), spec).unwrap();
         for _ in 0..48_000 * 2 {
-            wav.write_sample(1.0f32).unwrap();
+            writer.write_sample(1.0f32).unwrap();
         }
-        wav.finalize().unwrap();
-        let evaluator = Evaluator::new(
-            48_000,
-            Resources {
-                root: root.clone(),
-                sample_dirs: vec![root.clone()],
-            },
-        );
-        (evaluator, root)
+        writer.finalize().unwrap();
+        bundle.put(ResourceKind::Sample, "ones.wav", wav);
+        Evaluator::new(48_000, bundle)
     }
 
     /// Render a node to completion, or `max` frames.
@@ -1659,7 +1650,7 @@ mod tests {
 
     #[test]
     fn numbers_and_controls_combine() {
-        let (mut ev, root) = with_resources();
+        let mut ev = with_resources();
         // Plain number arithmetic stays numbers.
         let half = render_with(&mut ev, &format!("({ONES} * (0.25 + 0.25)).play"));
         assert_eq!(half[100], [0.5, 0.5]);
@@ -1674,12 +1665,11 @@ mod tests {
         );
         assert!((mixed[24_000][0] - 0.5).abs() < 1e-3);
         assert!((mixed[0][0] - 0.25).abs() < 1e-3);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn repeated_modulation_is_an_lfo() {
-        let (mut ev, root) = with_resources();
+        let mut ev = with_resources();
         let saw = render_with(
             &mut ev,
             &format!(r#"{ONES}.repeat(3).gain(modulation("ramp").repeat(2)).play"#),
@@ -1688,12 +1678,11 @@ mod tests {
         assert!((saw[48_000 + 12_000][0] - 0.25).abs() < 1e-3);
         // After two passes it holds its last value.
         assert!((saw[48_000 * 2 + 12_000][0] - 1.0).abs() < 1e-3);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn gated_envelope_ends_the_sound_after_its_release() {
-        let (mut ev, root) = with_resources();
+        let mut ev = with_resources();
         let note = render_with(
             &mut ev,
             &format!(r#"({ONES}.repeat(inf) * envelope("slow").gate(1500ms)).play"#),
@@ -1711,7 +1700,6 @@ mod tests {
         // Without a gate it never releases: the sound lasts as long as it does.
         let held = render_with(&mut ev, &format!(r#"({ONES} * envelope("slow")).play"#));
         assert_eq!(held.len(), 48_000);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Upward zero crossings per second.
@@ -1831,7 +1819,7 @@ mod tests {
 
     #[test]
     fn patterns_need_a_fitting_instrument() {
-        let (mut ev, root) = with_resources();
+        let mut ev = with_resources();
         let lead = r#"wavetable("basic", 0, 0, ?note)"#;
         assert_eq!(
             error_with(&mut ev, r#"notes("c2 q", 0.25b)"#),
@@ -1863,12 +1851,11 @@ mod tests {
             panic!()
         };
         assert_eq!((pattern.steps.len(), slot.as_deref()), (4, Some("drums")));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn voices_for_notes() {
-        let (mut ev, root) = with_resources();
+        let mut ev = with_resources();
         run(
             &mut ev,
             r#"let lead = wavetable("basic", 0, 0, ?note) * envelope("slow")"#,
@@ -1901,12 +1888,11 @@ mod tests {
             error_with(&mut ev, "0.5.latch"),
             "latch: expected a modulation, got a number"
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn resource_errors() {
-        let (mut ev, root) = with_resources();
+        let mut ev = with_resources();
         assert_eq!(
             error_with(&mut ev, r#"envelope("nope")"#),
             "envelope: \"nope\" doesn't exist yet (envelopes/nope.json): put the cursor on it to create it"
@@ -1919,6 +1905,5 @@ mod tests {
             error_with(&mut ev, r#"play(modulation("ramp"))"#),
             "play: expected a sound, got a control"
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

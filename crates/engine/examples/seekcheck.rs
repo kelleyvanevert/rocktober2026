@@ -3,7 +3,7 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = std::path::Path::new(&args[1]);
+    let path = &rocktober_engine::sample::Source::File(args[1].clone().into());
     let (start, end): (f64, f64) = (args[2].parse().unwrap(), args[3].parse().unwrap());
     let whole = rocktober_engine::sample::load(path).unwrap();
     let window = rocktober_engine::sample::load_range(path, start, Some(end)).unwrap();

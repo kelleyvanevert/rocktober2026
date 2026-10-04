@@ -1,9 +1,9 @@
 //! Resources: data that's better kept in a file than written as code, referenced
-//! by name, like `sample("kick.mp3")` or `envelope("pluck")`. Each kind lives in
-//! its own folder next to the code file (`samples/`, `envelopes/`, ...).
+//! by name, like `sample("kick.mp3")` or `envelope("pluck")`. They're stored in
+//! the `.rock` file, in a folder per kind (`samples/`, `envelopes/`, ...; see
+//! `bundle`).
 
 use std::ops::Range;
-use std::path::{Path, PathBuf};
 
 use crate::lang::{Token, lex};
 
@@ -36,7 +36,7 @@ impl ResourceKind {
         }
     }
 
-    /// The folder this kind lives in.
+    /// The folder this kind lives in, in a `.rock` file.
     pub fn dir(self) -> &'static str {
         match self {
             ResourceKind::Sample => "samples",
@@ -58,45 +58,14 @@ impl ResourceKind {
         }
     }
 
-    /// Where the resource's file is, or would be, for code in `root`.
-    pub fn path(self, root: &Path, name: &str) -> PathBuf {
-        root.join(self.dir()).join(self.file_name(name))
+    /// Where the resource is, or would be, in a `.rock` file.
+    pub fn bundle_path(self, name: &str) -> String {
+        format!("{}/{}", self.dir(), self.file_name(name))
     }
 
     fn from_function(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.function() == name)
     }
-}
-
-/// Where a program's resources are.
-#[derive(Clone, Debug)]
-pub struct Resources {
-    /// The folder of the code file, which has `envelopes/`, `modulations/`, ...
-    pub root: PathBuf,
-    /// Where `sample("...")` looks for files, in order.
-    pub sample_dirs: Vec<PathBuf>,
-}
-
-impl Resources {
-    /// For the code file at `path`. Samples are looked for next to it, then in
-    /// the working directory, each with and without a `samples/` subfolder.
-    pub fn for_code(path: &Path) -> Self {
-        let mut sample_dirs = vec![PathBuf::from("."), PathBuf::from("samples")];
-        let root = match path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            Some(dir) => {
-                sample_dirs.insert(0, dir.join("samples"));
-                sample_dirs.insert(0, dir.to_path_buf());
-                dir.to_path_buf()
-            }
-            None => PathBuf::from("."),
-        };
-        Self { root, sample_dirs }
-    }
-}
-
-/// The first of `dirs` that has a file called `name`.
-pub fn find(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
-    dirs.iter().map(|dir| dir.join(name)).find(|p| p.is_file())
 }
 
 /// A resource referenced in the code.
@@ -209,14 +178,13 @@ add(envelope("pluck"), wavetable("basic", 0.2))"#;
 
     #[test]
     fn file_names() {
-        let root = Path::new("music");
         assert_eq!(
-            ResourceKind::Envelope.path(root, "pluck"),
-            Path::new("music/envelopes/pluck.json")
+            ResourceKind::Envelope.bundle_path("pluck"),
+            "envelopes/pluck.json"
         );
         assert_eq!(
-            ResourceKind::Sample.path(root, "drums/kick.mp3"),
-            Path::new("music/samples/drums/kick.mp3")
+            ResourceKind::Sample.bundle_path("drums/kick.mp3"),
+            "samples/drums/kick.mp3"
         );
     }
 }

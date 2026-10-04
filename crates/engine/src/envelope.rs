@@ -6,11 +6,9 @@
 //! (which isn't known until it's played), and the release runs from note-off,
 //! starting from wherever the envelope was at that moment.
 
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
 
-use crate::curve::{self, load_json, save_json};
+use crate::curve;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -52,14 +50,15 @@ impl Envelope {
     /// The longest a stage can take, in seconds.
     pub const MAX_TIME: f64 = 60.0;
 
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let mut envelope: Self = load_json(path)?;
+    /// Read a JSON file's contents; `name` is for messages.
+    pub fn from_json(name: &str, data: &[u8]) -> Result<Self, String> {
+        let mut envelope: Self = curve::from_json(name, data)?;
         envelope.normalize();
         Ok(envelope)
     }
 
-    pub fn save(&self, path: &Path) -> Result<(), String> {
-        save_json(self, path)
+    pub fn to_json(&self) -> Vec<u8> {
+        curve::to_json(self)
     }
 
     /// Clamp everything into range.
@@ -135,11 +134,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_json() {
-        let dir = std::env::temp_dir().join(format!("rocktober-env-{}", std::process::id()));
-        let path = dir.join("envelopes/pluck.json");
         let env = Envelope::default();
-        env.save(&path).unwrap();
-        assert_eq!(Envelope::load(&path).unwrap(), env);
-        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(Envelope::from_json("pluck", &env.to_json()).unwrap(), env);
     }
 }

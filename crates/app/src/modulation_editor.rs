@@ -5,13 +5,13 @@
 //! it, alt-click a point to remove it, alt-drag a segment to bend it.
 
 use std::cell::Cell;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme, Sizable, h_flex, v_flex};
 use gpui_kit::*;
+use rocktober_engine::bundle::Bundle;
 use rocktober_engine::lang::{self, Expr};
 use rocktober_engine::modulation::{self, Modulation};
 use rocktober_engine::resource::ResourceKind;
@@ -39,7 +39,8 @@ enum Drag {
 
 pub struct ModulationEditor {
     name: String,
-    path: PathBuf,
+    /// The `.rock` file's resources, where the modulation is read from and saved to.
+    bundle: Bundle,
     state: State,
     drag: Option<Drag>,
     /// The point under the mouse.
@@ -90,16 +91,13 @@ fn from_screen(area: Bounds<Pixels>, (x, y): (f32, f32)) -> (f64, f64) {
 }
 
 impl ModulationEditor {
-    /// `root` is the folder of the code file.
-    pub fn new(name: &str, root: &Path, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let path = ResourceKind::Modulation.path(root, name);
-        let state = if path.exists() {
-            match Modulation::load(&path) {
+    pub fn new(name: &str, bundle: Bundle, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let state = match bundle.get(ResourceKind::Modulation, name) {
+            Some(entry) => match Modulation::from_json(name, &entry.data) {
                 Ok(m) => State::Loaded(m),
                 Err(e) => State::Failed(e),
-            }
-        } else {
-            State::Missing
+            },
+            None => State::Missing,
         };
         let length = cx.new(|cx| InputState::new(window, cx));
         let subscription = cx.subscribe_in(
@@ -113,7 +111,7 @@ impl ModulationEditor {
         );
         let mut editor = Self {
             name: name.to_string(),
-            path,
+            bundle,
             state,
             drag: None,
             hover: None,
@@ -134,28 +132,23 @@ impl ModulationEditor {
 
     pub fn create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.state = State::Loaded(Modulation::default());
-        if self.save(cx) {
-            cx.emit(ResourceEvent::Info(format!(
-                "created {}/{}",
-                ResourceKind::Modulation.dir(),
-                ResourceKind::Modulation.file_name(&self.name)
-            )));
-        }
+        self.save(cx);
+        cx.emit(ResourceEvent::Info(format!(
+            "created {}",
+            ResourceKind::Modulation.bundle_path(&self.name)
+        )));
         self.show_length(window, cx);
         cx.notify();
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) -> bool {
+    /// Into the bundle; the `.rock` file is written when it's saved.
+    fn save(&mut self, cx: &mut Context<Self>) {
         let State::Loaded(m) = &self.state else {
-            return false;
+            return;
         };
-        match m.save(&self.path) {
-            Ok(()) => true,
-            Err(e) => {
-                cx.emit(ResourceEvent::Error(e));
-                false
-            }
-        }
+        self.bundle
+            .put(ResourceKind::Modulation, &self.name, m.to_json());
+        cx.emit(ResourceEvent::Changed);
     }
 
     fn show_length(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -419,11 +412,7 @@ impl Render for ModulationEditor {
                 .child(e.clone())
                 .into_any_element(),
             State::Missing => {
-                let file = format!(
-                    "{}/{}",
-                    ResourceKind::Modulation.dir(),
-                    ResourceKind::Modulation.file_name(&self.name)
-                );
+                let file = ResourceKind::Modulation.bundle_path(&self.name);
                 let this = cx.entity().downgrade();
                 curve_view::missing(
                     file,

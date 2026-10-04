@@ -12,7 +12,8 @@ use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rocktober_engine::Session;
-use rocktober_engine::resource::{self, ResourceKind, ResourceRef, Resources};
+use rocktober_engine::bundle::{self, Bundle};
+use rocktober_engine::resource::{self, ResourceKind, ResourceRef};
 
 use crate::envelope_editor::EnvelopeEditor;
 use crate::modulation_editor::ModulationEditor;
@@ -85,6 +86,9 @@ enum ResourceView {
 
 pub struct Workspace {
     path: PathBuf,
+    /// The resources in the `.rock` file (shared with the session's evaluator).
+    bundle: Bundle,
+    /// Whether the code or the resources changed since the file was saved.
     dirty: bool,
     editor: Entity<EditorState>,
     flash: RangeDecorationCollection,
@@ -109,8 +113,12 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// `code` is what `bundle::open` read from `path` (`None` for a new file),
+    /// and the session was started with `bundle`.
     pub fn new(
         path: PathBuf,
+        code: Result<Option<String>, String>,
+        bundle: Bundle,
         session: Result<Session, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -123,17 +131,21 @@ impl Workspace {
             })
         };
 
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => {
+        let text = match code {
+            Ok(Some(text)) => {
                 info(LogKind::Info, format!("opened {}", path.display()));
                 text
             }
-            Err(_) => {
+            Ok(None) => {
                 info(
                     LogKind::Info,
                     format!("new file {} (cmd-s to save)", path.display()),
                 );
                 EXAMPLE.to_string()
+            }
+            Err(e) => {
+                info(LogKind::Error, format!("can't open {e}"));
+                String::new()
             }
         };
 
@@ -222,6 +234,7 @@ impl Workspace {
 
         let mut workspace = Self {
             path,
+            bundle,
             dirty: false,
             editor,
             flash,
@@ -271,17 +284,22 @@ impl Workspace {
         }
     }
 
-    /// Where the code's samples, envelopes, ... are.
-    fn resources(&self) -> Resources {
-        match &self.session {
-            Some(session) => session.resources().clone(),
-            None => Resources::for_code(&self.path),
-        }
+    /// The resources in the `.rock` file.
+    pub fn bundle(&self) -> &Bundle {
+        &self.bundle
     }
 
-    /// The folder of the code file, where its resources live.
+    /// Whether there are changes that haven't been saved.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// The folder the `.rock` file is in.
     fn code_dir(&self) -> PathBuf {
-        self.resources().root
+        match self.path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => PathBuf::from("."),
+        }
     }
 
     /// The console contents, oldest first.
@@ -382,7 +400,7 @@ impl Workspace {
 
     fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).value();
-        match std::fs::write(&self.path, text.as_str()) {
+        match bundle::save(&self.path, text.as_str(), &self.bundle) {
             Ok(()) => {
                 self.dirty = false;
                 self.push_log(LogKind::Info, format!("saved {}", self.path.display()), cx);
@@ -506,24 +524,23 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> OpenResource {
-        let root = self.code_dir();
+        let bundle = self.bundle.clone();
         let name = reference.name.clone();
         let (view, subscription) = match reference.kind {
             ResourceKind::Sample => {
-                let dirs = self.resources().sample_dirs;
                 let cache = self.overviews.clone();
                 let times = reference.times.clone();
-                let editor = cx.new(|cx| SampleEditor::new(&name, times, &dirs, &root, cache, cx));
+                let editor = cx.new(|cx| SampleEditor::new(&name, times, bundle, cache, cx));
                 let subscription = self.log_resource_events(&editor, cx);
                 (ResourceView::Sample(editor), Some(subscription))
             }
             ResourceKind::Envelope => {
-                let editor = cx.new(|_| EnvelopeEditor::new(&name, &root));
+                let editor = cx.new(|_| EnvelopeEditor::new(&name, bundle));
                 let subscription = self.log_resource_events(&editor, cx);
                 (ResourceView::Envelope(editor), Some(subscription))
             }
             ResourceKind::Modulation => {
-                let editor = cx.new(|cx| ModulationEditor::new(&name, &root, window, cx));
+                let editor = cx.new(|cx| ModulationEditor::new(&name, bundle, window, cx));
                 let subscription = self.log_resource_events(&editor, cx);
                 (ResourceView::Modulation(editor), Some(subscription))
             }
@@ -545,6 +562,13 @@ impl Workspace {
             let (kind, text) = match event {
                 ResourceEvent::Info(text) => (LogKind::Info, text.clone()),
                 ResourceEvent::Error(text) => (LogKind::Error, text.clone()),
+                ResourceEvent::Changed => {
+                    if !this.dirty {
+                        this.dirty = true;
+                        cx.notify();
+                    }
+                    return;
+                }
             };
             this.push_log(kind, text, cx);
         })

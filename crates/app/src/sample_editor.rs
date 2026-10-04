@@ -1,23 +1,26 @@
 //! The editor for `sample("...")`: the waveform, its length, and the time under
-//! the mouse, which a click copies. A missing sample can be dropped in.
+//! the mouse, which a click copies. A missing sample can be dropped in, which
+//! adds it to the `.rock` file.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::SystemTime;
 
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::*;
-use rocktober_engine::resource::{self, ResourceKind};
+use rocktober_engine::bundle::Bundle;
+use rocktober_engine::eval::sample_source;
+use rocktober_engine::resource::ResourceKind;
 use rocktober_engine::sample::{self, Overview};
 
 use crate::ResourceEvent;
 
-/// Overviews by file and modification time, shared by all sample editors, so
-/// moving the cursor back and forth doesn't decode a file again.
-pub type OverviewCache = Rc<RefCell<HashMap<(PathBuf, Option<SystemTime>), Arc<Overview>>>>;
+/// Overviews by where they're from (see `sample_source`), shared by all sample
+/// editors, so moving the cursor back and forth doesn't decode a file again.
+pub type OverviewCache = Rc<RefCell<HashMap<String, Arc<Overview>>>>;
 
 enum State {
     Loading,
@@ -28,8 +31,9 @@ enum State {
 
 pub struct SampleEditor {
     name: String,
-    /// Where a dropped file is copied to, if the sample doesn't exist.
-    target: PathBuf,
+    /// The `.rock` file's resources, where the sample is read from, and a
+    /// dropped file is added to.
+    bundle: Bundle,
     state: State,
     /// Times among the call's arguments (start and maybe end), shaded.
     times: Vec<f64>,
@@ -50,28 +54,23 @@ pub fn format_time(seconds: f64) -> String {
 }
 
 impl SampleEditor {
-    /// `dirs` are where samples are looked for, and `root` is the folder of the
-    /// code file, whose `samples/` a dropped file is copied into.
     pub fn new(
         name: &str,
         times: Vec<f64>,
-        dirs: &[PathBuf],
-        root: &Path,
+        bundle: Bundle,
         cache: OverviewCache,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut editor = Self {
             name: name.to_string(),
-            target: ResourceKind::Sample.path(root, name),
+            bundle,
             state: State::Missing,
             times,
             hover: None,
             bounds: Rc::new(Cell::new(Bounds::default())),
             cache,
         };
-        if let Some(path) = resource::find(dirs, name) {
-            editor.load(path, cx);
-        }
+        editor.load(cx);
         editor
     }
 
@@ -86,9 +85,11 @@ impl SampleEditor {
         matches!(self.state, State::Loaded(_))
     }
 
-    fn load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        let key = (path.clone(), modified);
+    fn load(&mut self, cx: &mut Context<Self>) {
+        let Some((key, source)) = sample_source(&self.bundle, &self.name) else {
+            self.state = State::Missing;
+            return;
+        };
         if let Some(overview) = self.cache.borrow().get(&key) {
             self.state = State::Loaded(overview.clone());
             return;
@@ -96,7 +97,7 @@ impl SampleEditor {
         self.state = State::Loading;
         let task = cx
             .background_executor()
-            .spawn(async move { sample::overview(&path) });
+            .spawn(async move { sample::overview(&source) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -114,34 +115,32 @@ impl SampleEditor {
         .detach();
     }
 
-    /// Copy a dropped file to where the code expects the sample.
+    /// Add a dropped file to the `.rock` file, under the sample's name.
     fn add(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
-        let Some(source) = paths.paths().first() else {
+        let Some(dropped) = paths.paths().first() else {
             return;
         };
         let ext = |p: &Path| p.extension().map(|e| e.to_string_lossy().to_lowercase());
-        if ext(source) != ext(&self.target) {
+        let wanted = ext(Path::new(&self.name));
+        if ext(dropped) != wanted {
             cx.emit(ResourceEvent::Error(format!(
                 "{} needs a .{} file",
                 self.name,
-                ext(&self.target).unwrap_or_default()
+                wanted.unwrap_or_default()
             )));
             return;
         }
-        let copied = self
-            .target
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::copy(source, &self.target));
-        match copied {
-            Ok(_) => {
+        match std::fs::read(dropped) {
+            Ok(data) => {
+                self.bundle.put(ResourceKind::Sample, &self.name, data);
                 cx.emit(ResourceEvent::Info(format!(
                     "added {}",
-                    self.target.display()
+                    ResourceKind::Sample.bundle_path(&self.name)
                 )));
-                self.load(self.target.clone(), cx);
+                cx.emit(ResourceEvent::Changed);
+                self.load(cx);
             }
-            Err(e) => cx.emit(ResourceEvent::Error(format!("can't copy the sample: {e}"))),
+            Err(e) => cx.emit(ResourceEvent::Error(format!("can't add the sample: {e}"))),
         }
         cx.notify();
     }
@@ -295,12 +294,12 @@ impl Render for SampleEditor {
                     .text_sm()
                     .text_color(muted)
                     .child(format!(
-                        "{}/{} doesn't exist: drop an audio file here to add it",
-                        ResourceKind::Sample.dir(),
+                        "\"{}\" isn't in this file yet: drop an audio file here to add it",
                         self.name
                     ))
                     .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(hover_bg))
                     .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.add(paths, cx)))
+                    .test_support()
                     .into_any_element()
             }
         };
