@@ -72,3 +72,7 @@ Anyhow, for today, this is enough. I did add some UI though, using Zed's `gpui`.
 ## Okt 3
 
 TODO
+
+## Okt 4
+
+TODO
