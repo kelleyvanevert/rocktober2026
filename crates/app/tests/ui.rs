@@ -101,6 +101,20 @@ mod macos {
                 .unwrap();
         }
 
+        /// Select `range` (byte offsets), then press `keys`.
+        fn press_with_selection(&mut self, range: std::ops::Range<usize>, keys: &str) {
+            let editor = self
+                .cx
+                .update(|cx| self.workspace.read(cx).editor().clone());
+            self.cx
+                .update_window(self.window, |_, window, cx| {
+                    editor.update(cx, |state, cx| state.set_selected_range(range, cx));
+                    window.press(keys, cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+        }
+
         /// Put the cursor at (line, column), both 0-based, and let any loading
         /// that starts finish.
         fn move_to(&mut self, line: u32, column: u32) {
@@ -235,7 +249,7 @@ mod macos {
 
         // cmd-enter runs the block under the cursor, without inserting a newline.
         let before = h.text();
-        h.press_at(8, 5, "cmd-enter");
+        h.press_at(9, 5, "cmd-enter");
         assert_eq!(h.text(), before, "cmd-enter must not edit the text");
         assert_eq!(h.last_log(), r#"sample("kick.mp3").fit(500ms).play"#);
         h.snapshot("2-run-block");
@@ -374,6 +388,18 @@ mod macos {
         );
         let entry = saved.get(ResourceKind::Modulation, "sweep").unwrap();
         assert_eq!(Modulation::from_json("sweep", &entry.data).unwrap(), m);
+
+        // cmd-/ comments out the selected lines, or uncomments them, as one undo step.
+        h.set_text("seq(\n  a,\n  b,\n)\n");
+        assert!(!h.dirty());
+        h.press_with_selection(6..12, "cmd-/");
+        assert_eq!(h.text(), "seq(\n  -- a,\n  -- b,\n)\n");
+        assert!(h.dirty());
+        h.press_at(1, 0, "cmd-/");
+        assert_eq!(h.text(), "seq(\n  a,\n  -- b,\n)\n");
+        h.press_at(0, 0, "cmd-z");
+        assert_eq!(h.text(), "seq(\n  -- a,\n  -- b,\n)\n");
+        h.snapshot("10-comment");
 
         println!("ui: passed");
     }

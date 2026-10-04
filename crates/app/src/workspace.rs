@@ -19,7 +19,8 @@ use crate::envelope_editor::EnvelopeEditor;
 use crate::modulation_editor::ModulationEditor;
 use crate::sample_editor::{OverviewCache, SampleEditor};
 use crate::{
-    ResourceEvent, RunAll, RunBlock, Save, StopAll, StopBlock, ToggleRecording, blocks, comments,
+    ResourceEvent, RunAll, RunBlock, Save, StopAll, StopBlock, ToggleComment, ToggleRecording,
+    blocks, comments,
 };
 
 const FLASH_DURATION: Duration = Duration::from_millis(250);
@@ -30,6 +31,7 @@ const EXAMPLE: &str = r#"-- cmd-enter       run the selection, or the block unde
 -- cmd-.           stop what the block plays into named slots
 -- cmd-shift-.     stop all sound
 -- cmd-r           start/stop recording to recordings/
+-- cmd-/           comment/uncomment the selected lines
 
 sample("kick.mp3").play
 
@@ -402,6 +404,17 @@ impl Workspace {
         }
     }
 
+    /// Comment out the selected lines, or uncomment them if they all are.
+    fn toggle_comment(&mut self, _: &ToggleComment, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |state, cx| {
+            let toggle = comments::toggle(&state.value(), state.selected_range());
+            // `replace` edits the selection, as one undo step.
+            state.set_selected_range(toggle.range, cx);
+            state.replace(toggle.text, window, cx);
+            state.set_selected_range(toggle.selection, cx);
+        });
+    }
+
     fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).value();
         match bundle::save(&self.path, text.as_str(), &self.bundle) {
@@ -743,6 +756,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::stop_all))
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::toggle_recording))
+            .on_action(cx.listener(Self::toggle_comment))
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)

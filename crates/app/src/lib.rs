@@ -26,6 +26,7 @@ actions!(
         StopAll,
         Save,
         ToggleRecording,
+        ToggleComment,
         Quit
     ]
 );
@@ -48,6 +49,7 @@ pub fn init(cx: &mut App) {
             KeyBinding::new("cmd->", StopAll, context),
             KeyBinding::new("cmd-s", Save, context),
             KeyBinding::new("cmd-r", ToggleRecording, context),
+            KeyBinding::new("cmd-/", ToggleComment, context),
         ]);
     }
     cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
