@@ -317,6 +317,66 @@ impl ControlNode for Map {
     }
 }
 
+/// Scales by name: each one's steps, in semitones above the root, within an
+/// octave.
+pub const SCALES: &[(&str, &[u8])] = &[
+    ("major", &[0, 2, 4, 5, 7, 9, 11]),
+    ("minor", &[0, 2, 3, 5, 7, 8, 10]),
+    ("harmonic minor", &[0, 2, 3, 5, 7, 8, 11]),
+    ("melodic minor", &[0, 2, 3, 5, 7, 9, 11]),
+    ("dorian", &[0, 2, 3, 5, 7, 9, 10]),
+    ("phrygian", &[0, 1, 3, 5, 7, 8, 10]),
+    ("lydian", &[0, 2, 4, 6, 7, 9, 11]),
+    ("mixolydian", &[0, 2, 4, 5, 7, 9, 10]),
+    ("locrian", &[0, 1, 3, 5, 6, 8, 10]),
+    ("major pentatonic", &[0, 2, 4, 7, 9]),
+    ("minor pentatonic", &[0, 3, 5, 7, 10]),
+    ("blues", &[0, 3, 5, 6, 7, 10]),
+    ("chromatic", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+];
+
+pub fn scale(name: &str) -> Option<&'static [u8]> {
+    SCALES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, steps)| *steps)
+}
+
+/// A scale degree (rounded to a whole one) as semitones above the root: 0 is
+/// the root, 1 the next note up, `steps.len()` the root an octave up, -1 the
+/// note below the root.
+pub fn degree_to_semitones(steps: &[u8], degree: f32) -> f32 {
+    let degree = degree.round() as i64;
+    let len = steps.len() as i64;
+    (degree.div_euclid(len) * 12 + steps[degree.rem_euclid(len) as usize] as i64) as f32
+}
+
+/// Scale degrees to semitones above the root (see `degree_to_semitones`).
+pub struct ScaleDegree {
+    x: Box<dyn ControlNode>,
+    steps: &'static [u8],
+}
+
+impl ScaleDegree {
+    pub fn new(x: Box<dyn ControlNode>, steps: &'static [u8]) -> Self {
+        Self { x, steps }
+    }
+}
+
+impl ControlNode for ScaleDegree {
+    fn process(&mut self, out: &mut [f32]) -> usize {
+        let n = self.x.process(out);
+        for x in &mut out[..n] {
+            *x = degree_to_semitones(self.steps, *x);
+        }
+        n
+    }
+
+    fn reset(&mut self) {
+        self.x.reset();
+    }
+}
+
 /// The pitch of a gliding phrase: a pattern's notes from step `start` on,
 /// each sliding from where the last one was to its own pitch over `glide`
 /// frames, in a straight line (in notes, so evenly in pitch). Hits without a
@@ -474,6 +534,20 @@ impl Param {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scale_degrees_wrap_into_octaves() {
+        let minor = scale("minor").unwrap();
+        let semis: Vec<f32> = (-2..=8)
+            .map(|d| degree_to_semitones(minor, d as f32))
+            .collect();
+        assert_eq!(semis, [-4., -2., 0., 2., 3., 5., 7., 8., 10., 12., 14.]);
+        assert_eq!(
+            degree_to_semitones(minor, 2.4),
+            3.0,
+            "rounds to a whole degree"
+        );
+    }
     use crate::envelope::Stage;
     use crate::modulation::Point;
 

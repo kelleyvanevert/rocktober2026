@@ -24,7 +24,7 @@ use crate::bundle::Bundle;
 use crate::clock::{Clock, Grid};
 use crate::control::{
     self, Combine, ControlNode, EnvelopePlayer, Map, ModulationPlayer, NotePath, Param,
-    RandomPlayer, Range,
+    RandomPlayer, Range, ScaleDegree,
 };
 use crate::envelope::Envelope;
 use crate::filter::{self, Filter};
@@ -522,6 +522,8 @@ pub enum Control {
         whole: bool,
     },
     Round(Box<Control>),
+    /// Scale degrees (rounded) to semitones above a scale's root.
+    Scale(Box<Control>, &'static [u8]),
     /// The pitch of a gliding phrase of a pattern (see `NotePath`): from step
     /// `start`, with steps and glide in seconds.
     NotePath {
@@ -544,7 +546,7 @@ impl Control {
         match self {
             Control::Mul(a, b) | Control::Add(a, b) => vec![a, b],
             Control::Range { x, lo, hi, .. } => vec![x, lo, hi],
-            Control::Round(x) => vec![x],
+            Control::Round(x) | Control::Scale(x, _) => vec![x],
             Control::Hole {
                 default: Some(d), ..
             } => vec![d],
@@ -565,6 +567,7 @@ impl Control {
                 whole: *whole,
             },
             Control::Round(x) => Control::Round(m(x)),
+            Control::Scale(x, steps) => Control::Scale(m(x), steps),
             Control::Hole {
                 name,
                 default: Some(d),
@@ -724,6 +727,9 @@ impl Control {
                 *whole,
             )),
             Control::Round(x) => Box::new(Map::new(x.instantiate(sample_rate), f32::round)),
+            Control::Scale(x, steps) => {
+                Box::new(ScaleDegree::new(x.instantiate(sample_rate), steps))
+            }
             Control::NotePath {
                 pattern,
                 start,
@@ -1574,6 +1580,30 @@ fn builtins() -> Vec<Builtin> {
         builtin("round", &[CONTROL], 1, |_, c| {
             control(Control::Round(Box::new(c.control(0))))
         }),
+        // A scale degree (0 is the root, 7 the root an octave up in a
+        // 7-note scale, -1 the note below) to a pitch:
+        // `random(1b).range(-0.5, 6.5).scale("minor", f4)`.
+        builtin(
+            "scale",
+            &[
+                CONTROL,
+                P(Type::String, "a scale (like \"minor\")"),
+                P(Type::Control, "a root (like f4)"),
+            ],
+            3,
+            |_, c| {
+                let name = c.args[1].str();
+                let Some(steps) = control::scale(name) else {
+                    let names: Vec<_> = control::SCALES.iter().map(|(n, _)| *n).collect();
+                    return Err(c.fail(
+                        1,
+                        format!("unknown scale \"{name}\" (try {})", names.join(", ")),
+                    ));
+                };
+                let degree = Control::Scale(Box::new(c.control(0)), steps);
+                control(Control::Add(Box::new(c.control(2)), Box::new(degree)))
+            },
+        ),
         builtin(
             "glide",
             &[
@@ -2704,6 +2734,35 @@ mod tests {
         assert_eq!(
             error(r#"sample("kick.mp3").echo(0ms)"#),
             "echo: expected a delay time above 0, got a duration"
+        );
+    }
+
+    #[test]
+    fn scale_picks_notes_from_the_scale() {
+        let mut ev = evaluator();
+        run(
+            &mut ev,
+            r#"let r = random(10ms).range(-0.5, 6.5).scale("minor", f4)"#,
+        );
+        let Value::Control(c) = &ev.vars["r"] else {
+            panic!()
+        };
+        let mut buf = vec![0.0; 48_000];
+        c.instantiate(48_000).process(&mut buf);
+        // F minor from F4 (65): F G Ab Bb C Db Eb, every one of them.
+        let f_minor = [65.0, 67.0, 68.0, 70.0, 72.0, 73.0, 75.0];
+        assert!(buf.iter().all(|n| f_minor.contains(n)), "{buf:?}");
+        assert!(f_minor.iter().all(|n| buf.contains(n)));
+        assert_eq!(
+            error(r#"1.scale("nope", c4)"#),
+            format!(
+                "scale: unknown scale \"nope\" (try {})",
+                control::SCALES
+                    .iter()
+                    .map(|(n, _)| *n)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         );
     }
 
