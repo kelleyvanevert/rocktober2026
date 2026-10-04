@@ -80,6 +80,44 @@ impl Node for Pan {
     }
 }
 
+/// Saturation: `tanh(drive * x) / tanh(drive)`. Full scale stays full scale,
+/// but the louder a sound is, the more it's squashed, which adds overtones: on
+/// a bass, ones small speakers can play. A drive of 1 barely touches it, 4
+/// (12db) is warm, 16 (24db) is fuzz.
+pub struct Drive {
+    child: Box<dyn Node>,
+    drive: Param,
+}
+
+impl Drive {
+    pub fn new(child: Box<dyn Node>, drive: Param) -> Self {
+        Self { child, drive }
+    }
+}
+
+impl Node for Drive {
+    fn process(&mut self, out: &mut [Frame]) -> usize {
+        let Self { child, drive } = self;
+        chunked(out, &mut [drive], |chunk, params| {
+            let n = child.process(chunk);
+            let n = next_all(params, n);
+            for (i, frame) in chunk[..n].iter_mut().enumerate() {
+                let drive = params[0].get(i).max(0.01);
+                let norm = drive.tanh();
+                for s in frame.iter_mut() {
+                    *s = (*s * drive).tanh() / norm;
+                }
+            }
+            n
+        })
+    }
+
+    fn reset(&mut self) {
+        self.child.reset();
+        self.drive.reset();
+    }
+}
+
 /// The two chorus voices on each side: base delay and depth (seconds), and
 /// LFO rate (Hz). The right side runs half a cycle behind the left, so the
 /// two sides always differ: that difference is the width.
@@ -363,6 +401,18 @@ mod tests {
         assert!((left[0] - std::f32::consts::SQRT_2).abs() < 1e-5 && left[1].abs() < 1e-5);
         let right = at(1.0);
         assert!(right[0].abs() < 1e-5 && right[1] > 1.4);
+    }
+
+    #[test]
+    fn drive_keeps_full_scale_and_squashes_below_it() {
+        let out = render(&mut Drive::new(
+            source(vec![[1.0, -1.0], [0.25, 0.0]]),
+            Param::Const(4.0),
+        ));
+        assert!((out[0][0] - 1.0).abs() < 1e-5 && (out[0][1] + 1.0).abs() < 1e-5);
+        // 0.25 comes out much closer to full scale: that's the squashing.
+        assert!(out[1][0] > 0.7 && out[1][0] < 1.0, "{}", out[1][0]);
+        assert_eq!(out[1][1], 0.0);
     }
 
     /// A mono sine, one second.

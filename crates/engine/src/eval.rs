@@ -28,7 +28,7 @@ use crate::control::{
 };
 use crate::envelope::Envelope;
 use crate::filter::{self, Filter};
-use crate::fx::{Echo, EchoParams, Pan, Spread};
+use crate::fx::{Drive, Echo, EchoParams, Pan, Spread};
 use crate::lang::{Error, Expr, Spanned, hz_to_note};
 use crate::modulation::Modulation;
 use crate::nodes::{
@@ -57,6 +57,8 @@ const REVERB_MIX: f64 = 0.3;
 
 /// `spread` default amount.
 const SPREAD: f64 = 0.5;
+/// `drive` default: 12 dB into the saturation.
+const DRIVE: f64 = 4.0;
 /// `echo` defaults: feedback, wet/dry mix, and the band the repeats are
 /// filtered to.
 const ECHO_FEEDBACK: f64 = 0.5;
@@ -183,6 +185,8 @@ pub enum Sound {
     },
     Pan(Control, Box<Sound>),
     Spread(Control, Box<Sound>),
+    /// Saturation; the control is the gain into it.
+    Drive(Control, Box<Sound>),
     Echo {
         child: Box<Sound>,
         /// Seconds.
@@ -261,6 +265,10 @@ impl Sound {
                 let amount = f(amount);
                 Sound::Spread(amount, Box::new(child.map_controls(f)))
             }
+            Sound::Drive(drive, child) => {
+                let drive = f(drive);
+                Sound::Drive(drive, Box::new(child.map_controls(f)))
+            }
             Sound::Echo {
                 child,
                 time,
@@ -329,6 +337,7 @@ impl Sound {
             | Sound::Filter { child, .. }
             | Sound::Pan(_, child)
             | Sound::Spread(_, child)
+            | Sound::Drive(_, child)
             | Sound::Echo { child, .. }
             | Sound::Duck { child, .. } => child.is_endless(),
         }
@@ -424,6 +433,10 @@ impl Sound {
             Sound::Pan(position, child) => Box::new(Pan::new(
                 child.instantiate(sample_rate),
                 position.param(sample_rate),
+            )),
+            Sound::Drive(drive, child) => Box::new(Drive::new(
+                child.instantiate(sample_rate),
+                drive.param(sample_rate),
             )),
             Sound::Spread(amount, child) => Box::new(Spread::new(
                 child.instantiate(sample_rate),
@@ -1489,6 +1502,12 @@ fn builtins() -> Vec<Builtin> {
             &[SOUND, P(Type::Control, "an amount (0 to 1)")],
             1,
             |_, c| sound(Sound::Spread(c.control_or(1, SPREAD), Box::new(c.sound(0)))),
+        ),
+        builtin(
+            "drive",
+            &[SOUND, P(Type::Control, "a drive (like 4 or 12db)")],
+            1,
+            |_, c| sound(Sound::Drive(c.control_or(1, DRIVE), Box::new(c.sound(0)))),
         ),
         builtin("echo", ECHO, 2, |_, c| echo_with(c, false)),
         builtin("pingpong", ECHO, 2, |_, c| echo_with(c, true)),
