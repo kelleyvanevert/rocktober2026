@@ -68,3 +68,7 @@ Anyhow, for today, this is enough. I did add some UI though, using Zed's `gpui`.
         </tr>
     </tbody>
 </table>
+
+## Okt 3
+
+TODO
