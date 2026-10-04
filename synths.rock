@@ -1,0 +1,205 @@
+-- Synthesizers, 4 October 2026. Open with: cargo run -p rocktober -- synths.rock
+--
+-- Not a song: a box of separate instruments, each built from what we have
+-- (wavetables, envelopes, modulations, ring modulation, delay and reverb).
+-- Run one block at a time with cmd-enter; cmd-. on a block stops it again.
+-- Every example plays into its own slot, so they layer if you want them to.
+
+110.bpm
+
+
+-- 1. The basic shapes: the "basic" table morphs sine → triangle → saw →
+--    square, and the slow "rise" modulation walks through it in 8 seconds.
+
+(wavetable("basic", modulation("rise"), 0.6, c3) * 0.3).fit(8s).play("shapes")
+
+
+-- 2. Warp: a plain sine whose phase gets bent by a slow LFO. The energy bunches
+--    up in part of the cycle, which sounds like a resonant filter sweeping,
+--    the way Casio's CZ synths faked one.
+
+(wavetable("basic", 0, modulation("lfo").repeat(inf) * 0.95, c2) * 0.35).fit(16s).play("warp")
+
+
+-- 3. Acid bass: "bright" goes from a sine to a saw by adding harmonics, so its
+--    position works like a filter cutoff. Every note gets its own filter
+--    envelope (the "wobble" modulation, restarted per note), and how far it
+--    opens grows over 8 seconds ("rise"), as if someone turned the knob.
+
+let acid = wavetable(
+  "bright",
+  modulation("wobble").retrig * (modulation("rise").repeat(inf) * 0.75 + 0.1) + 0.05,
+  0.3,
+  ?note,
+) * envelope("pluck") * 0.45
+notes("c2 c2 c3 c2  eb2 c2 _ c3  c2 bb1 c2 c3  f2 eb2 c3 g1", 0.25b).play(acid, "acid")
+
+
+-- 4. PWM pad: a pulse wave whose width breathes with the slow "lfo", two of
+--    them a little out of tune with each other for chorus.
+
+let pwm = add(
+  wavetable("pulse", modulation("lfo").repeat(inf) * 0.8, 0, ?note),
+  wavetable("pulse", modulation("lfo").repeat(inf) * 0.8, 0, ?note + 0.12),
+) * envelope("pad") * 0.18
+notes("c3 _ _ _  ab2 _ _ _  eb3 _ _ _  bb2 _ _ _", 1b).play(pwm.reverb("hall", 0.3), "pwm")
+
+
+-- 5. Supersaw chord stabs: seven saws spread a fifth of a semitone apart,
+--    playing a minor chord on every note (one note in, three out: the
+--    "chord memory" of old polysynths).
+
+let saws = add(
+  wavetable("sine-saw", 1, 0, ?note + -0.3),
+  wavetable("sine-saw", 1, 0, ?note + -0.2),
+  wavetable("sine-saw", 1, 0, ?note + -0.1),
+  wavetable("sine-saw", 1, 0, ?note),
+  wavetable("sine-saw", 1, 0, ?note + 0.1),
+  wavetable("sine-saw", 1, 0, ?note + 0.2),
+  wavetable("sine-saw", 1, 0, ?note + 0.3),
+)
+let stab = add(saws, saws.with(note: ?note + 3), saws.with(note: ?note + 7)) * envelope("pluck") * 0.06
+notes(". . c4 .  . c4 . .  . . ab3 .  . bb3 . .", 0.25b).play(stab.reverb("plate", 0.25), "stab")
+
+
+-- 6. Drawbar organ: sines at the pipe lengths of a Hammond's drawbars (an
+--    octave below, the note, a fifth and an octave above, ...), each with its
+--    own level, and a tremolo from the "vibrato" modulation like a Leslie.
+
+let organ = add(
+  wavetable("basic", 0, 0, ?note + -12) * 0.8,
+  wavetable("basic", 0, 0, ?note) * 1.0,
+  wavetable("basic", 0, 0, ?note + 7) * 0.6,
+  wavetable("basic", 0, 0, ?note + 12) * 0.5,
+  wavetable("basic", 0, 0, ?note + 19) * 0.3,
+  wavetable("basic", 0, 0, ?note + 24) * 0.25,
+) * (modulation("vibrato").repeat(inf) * 0.25 + 0.75) * envelope("organ") * 0.08
+notes("c4 _ _ eb4  _ _ g4 _  f4 _ _ _  eb4 _ d4 _", 0.5b).play(organ, "organ")
+notes("g3 _ _ _  _ _ _ _  ab3 _ _ _  g3 _ _ _", 0.5b).play(organ, "organ2")
+
+
+-- 7. Brass: a horn gets brighter as it gets louder, so here the same envelope
+--    drives both the level and the brightness.
+
+let brass = wavetable("bright", envelope("reed") * 0.8, 0.15, ?note) * envelope("reed") * 0.4
+notes("g3 _ _ .  g3 . bb3 _  c4 _ _ _  _ . . .", 0.5b).play(brass.reverb("hall", 0.2), "brass")
+
+
+-- 8. Bells: ring modulation (multiplying two sines) gives the sum and the
+--    difference of their frequencies, which aren't harmonics of the note, so
+--    it sounds like metal. A plain sine underneath keeps the pitch clear.
+
+let bell = add(
+  wavetable("basic", 0, 0, ?note),
+  wavetable("basic", 0, 0, ?note) * wavetable("basic", 0, 0, ?note + 21.7),
+) * envelope("bell") * 0.25
+notes("c5 . g5 .  eb5 . . .  d5 . bb4 .  c5 . . .", 0.5b).play(bell.reverb("hall", 0.4), "bells")
+
+
+-- 9. Electric piano: a sine that decays slowly, plus a short metallic "tine"
+--    (ring modulation again) on the attack, and a slow tremolo.
+
+let epiano = add(
+  wavetable("basic", 0.05, 0, ?note) * envelope("upright"),
+  wavetable("basic", 0, 0, ?note) * wavetable("basic", 0, 0, ?note + 28) * envelope("banjo") * 0.4,
+) * (modulation("lfo").repeat(inf) * 0.3 + 0.7) * 0.35
+notes("eb4 . g4 bb4  . . d5 .  c4 . eb4 g4  . . bb4 .", 0.5b).play(epiano, "epiano")
+notes("ab2 _ _ _  _ _ _ _  f2 _ _ _  _ _ _ _", 0.5b).play(epiano, "epiano-bass")
+
+
+-- 10. Chiptune: two narrow pulse channels (one an octave up, a bit quieter)
+--     and a triangle bass, like a NES. The arpeggio fakes chords, one note at
+--     a time.
+
+let chip = wavetable("pulse", 0.75, 0, ?note) * envelope("hit") * 0.12
+notes("c5 eb5 g5 c6  c5 eb5 g5 c6  ab4 c5 eb5 ab5  bb4 d5 f5 bb5", 0.125b).play(chip, "chip")
+notes("g5 . . .  . . . .  eb5 . f5 .  g5 _ . .", 0.5b).play(chip.with(note: ?note + 12) * 0.6, "chip-lead")
+let triangle = wavetable("basic", 0.33, 0, ?note) * envelope("hit") * 0.35
+notes("c2 . c3 .  c2 . c3 .  ab1 . ab2 .  bb1 . bb2 .", 0.5b).play(triangle, "chip-bass")
+
+
+-- 11. A drum machine, all synthesized. The kick is a sine falling two octaves
+--     in a few milliseconds ("drop", restarted per hit). The snare is a click
+--     played through the small room preset, fully wet: the presets are
+--     decaying noise, so that's a noise burst. The cowbell is the 808's own
+--     recipe: two square waves at 540 and 800 Hz.
+
+let kick808 = wavetable("basic", 0, 0, g1 + modulation("drop").retrig * 30) * envelope("boom") * 0.7
+notes("x . . .  . . . x  . . x .  . . . .", 0.25b).play(kick808, "808-kick")
+
+let click = sample("kick.mp3").fit(2ms)
+let snare808 = add(
+  click.reverb("small_room", 1) * envelope("hit").gate(120ms),
+  wavetable("basic", 0, 0, e3 + modulation("drop").retrig * 5) * envelope("banjo") * 0.3,
+)
+notes(". . . .  x . . .  . . . .  x . . .", 0.25b).play(snare808, "808-snare")
+
+let cowbell = add(
+  wavetable("sine-square", 1, 0, c5 + 0.55),
+  wavetable("sine-square", 1, 0, g5 + 0.35),
+) * envelope("banjo") * 0.15
+notes(". . x .  . . . .  . . x .  . x . .", 0.25b).play(cowbell, "808-cowbell")
+
+
+-- 12. Hi-hats: no noise oscillator, so ring-modulate square waves at
+--     unrelated pitches: that makes a dense mess of high partials, which is
+--     how analog drum machines made their metal too.
+
+let hat808 = (
+  wavetable("sine-square", 1, 0, c8 + 0.3) * wavetable("sine-square", 1, 0, f#8 + 0.6)
+  + wavetable("sine-square", 1, 0, b7 + 0.1) * wavetable("sine-square", 1, 0, f8 + 0.8)
+) * envelope("hit").gate(25ms) * 0.3
+notes("x x x x  x x x .  x x x x  x . x x", 0.25b).play(hat808, "808-hat")
+
+
+-- 13. Laser: a square that falls four octaves in half a second ("wobble", per
+--     note). Short notes only catch the top of the fall.
+
+let zap = wavetable("sine-square", 1, 0.3, ?note + modulation("wobble").retrig * 48) * envelope("hit").gate(180ms) * 0.25
+notes("c4 . . c4  . . c3 .  c4 . . .  c5 . c4 .", 0.25b).play(zap, "zap")
+
+
+-- 14. Dub siren with tape echo: a square whose pitch saws down an octave over
+--     and over, played once, with three echoes, each quieter.
+
+let siren = (wavetable("sine-square", 0.8, 0, a4 + modulation("wobble").repeat(inf) * 12) * 0.12).fit(4b)
+add(
+  siren,
+  siren.delay(0.75b).gain(-6db),
+  siren.delay(1.5b).gain(-12db),
+  siren.delay(2.25b).gain(-18db),
+).reverb("plate", 0.3).play("siren")
+
+
+-- 15. Theremin: a sine with a lot of vibrato, played by your "bla" modulation
+--     (an octave from bottom to top), in a big space.
+
+(wavetable("basic", 0.1, 0, c4 + modulation("bla").repeat(inf) * 12 + modulation("vibrato").repeat(inf) * 0.5) * 0.25)
+  .fit(20s).reverb("hall", 0.4).play("theremin")
+
+
+-- 16. Robot voice: speech ring-modulated by a very low sine (30 Hz), the trick
+--     behind the Daleks' voices.
+
+(sample("recordings/2026-10-02 Silje 3.m4a", 0:06:500, 0:16:500) * wavetable("basic", 0, 0, a0 + 1.5) * 2).play("robot")
+
+
+-- 17. A talking synth: a word ring-modulated by a square wave at the note, so
+--     the word gets a pitch and you can play a melody with it.
+
+let word = sample("recordings/2026-07-23 Spanish speaking train conductor 3.m4a", 0:02:993, 0:03:393)
+let talker = word * wavetable("sine-square", 0.7, 0, ?note)
+notes("c3 . eb3 .  g3 . . bb3  c4 . bb3 .  g3 . . .", 0.25b).play(talker.reverb("plate", 0.2), "talker")
+
+
+-- 18. Sympathetic strings: a sound can be a reverb's space, so make the space
+--     a C minor chord that rings out, and every kick sets it ringing.
+
+let strings = (add(
+  wavetable("sine-saw", 0.6, 0, c3),
+  wavetable("sine-saw", 0.6, 0, g3),
+  wavetable("sine-saw", 0.6, 0, eb4),
+  wavetable("sine-saw", 0.6, 0, c5),
+) * envelope("string")).fit(3s)
+notes("x . . .  . . x .  . . . .  x . . .", 0.25b)
+  .play(sample("kick.mp3").fit(300ms).reverb(strings, 0.7).gain(-22db), "strings")
