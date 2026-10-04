@@ -13,6 +13,29 @@ const BUFFER_SECONDS: usize = 4;
 /// most this much.
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
 
+/// Write rendered frames to a WAV file, in the same format as recordings.
+pub fn write_wav(
+    path: &Path,
+    frames: &[crate::nodes::Frame],
+    sample_rate: u32,
+) -> Result<(), String> {
+    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| fail(&e))?;
+    }
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut wav = hound::WavWriter::create(path, spec).map_err(|e| fail(&e))?;
+    for sample in frames.iter().flatten() {
+        wav.write_sample(*sample).map_err(|e| fail(&e))?;
+    }
+    wav.finalize().map_err(|e| fail(&e))
+}
+
 pub struct Recording {
     pub path: PathBuf,
     pub started: Instant,

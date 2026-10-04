@@ -19,7 +19,10 @@
 //! ```
 //!
 //! Notes are written `c2`, `f#3`, `eb4` (`c4` is middle C, MIDI note 60; Ableton
-//! calls it C3). `let name = ...` names a value, and a bare `name` refers to it.
+//! calls it C3). A frequency like `800hz` or `2khz` is just another way to write
+//! a pitch, the way `-6db` is another way to write an amount. `at 4b` is a grid
+//! to start things on (the next multiple of 4 beats); it binds like a method
+//! call, so `at 5b + 2` is `add(at(5b), 2)`. `let name = ...` names a value, and a bare `name` refers to it.
 //! `?name` is a hole to be filled in later, `?name = 0.2` one with a default,
 //! and `name: value` (only in arguments) fills one, as in `lead.with(pos: 0.2)`.
 //!
@@ -102,6 +105,7 @@ pub(crate) enum Token {
     Plus,
     Pitch(f64),
     Let,
+    At,
     Question,
     Colon,
     Equals,
@@ -130,6 +134,11 @@ pub fn note(text: &str) -> Option<f64> {
         return None;
     };
     Some((12 * (*octave as i32 - b'0' as i32 + 1) + semitone + accidental) as f64)
+}
+
+/// The (fractional) MIDI note number of a frequency.
+pub fn hz_to_note(hz: f64) -> f64 {
+    69.0 + 12.0 * (hz / 440.0).log2()
 }
 
 /// Whether a '.' or '-' at `i` begins (or continues) a number rather than being
@@ -236,6 +245,18 @@ pub(crate) fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                     "bar" | "bars" => Token::Beats(value * 4.0),
                     // Decibels are just a way to write an amplitude factor.
                     "db" => Token::Num(10f64.powf(value / 20.0)),
+                    // And a frequency is just a way to write a pitch.
+                    "hz" | "khz" => {
+                        let hz = if &src[unit_start..i] == "khz" {
+                            value * 1000.0
+                        } else {
+                            value
+                        };
+                        if hz <= 0.0 {
+                            return err(start, "a frequency has to be above 0hz");
+                        }
+                        Token::Pitch(hz_to_note(hz))
+                    }
                     unit => return err(unit_start, format!("unknown unit '{unit}'")),
                 };
                 tokens.push((tok, start));
@@ -254,6 +275,7 @@ pub(crate) fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                 let tok = match &src[start..i] {
                     "inf" => Token::Num(f64::INFINITY),
                     "let" => Token::Let,
+                    "at" => Token::At,
                     name => match note(name) {
                         Some(note) => Token::Pitch(note),
                         None => Token::Ident(name.to_string()),
@@ -393,6 +415,12 @@ impl Parser {
                 };
                 Expr::Hole { name, default }
             }
+            // `at 4b`: a grid, as `at(4b)`. It takes a method chain, so it binds
+            // tighter than `*` and `+`.
+            Token::At => Expr::Call {
+                name: "at".to_string(),
+                args: vec![self.chain()?],
+            },
             Token::LParen => {
                 let inner = self.expr()?;
                 self.expect(Token::RParen, "')'")?;
@@ -621,6 +649,30 @@ mod tests {
         assert_eq!(parse("f(?)").unwrap_err().msg, "expected a name after '?'");
         let prog = parse("let a = 1\nlet b = 2\nf(a, b)").unwrap();
         assert_eq!(prog.len(), 3);
+    }
+
+    #[test]
+    fn frequencies_are_pitches() {
+        assert_eq!(desugar("f(440hz, 0.44khz)"), "f(note69, note69)");
+        let Expr::Call { args, .. } = &parse("f(880hz)").unwrap()[0].expr else {
+            panic!()
+        };
+        assert!(matches!(args[0].expr, Expr::Pitch(n) if (n - 81.0).abs() < 1e-9));
+        assert_eq!(
+            parse("f(0hz)").unwrap_err().msg,
+            "a frequency has to be above 0hz"
+        );
+    }
+
+    #[test]
+    fn at_makes_a_grid() {
+        assert_eq!(desugar("x.play(\"a\", at 4b)"), "play(x, \"a\", at(4b))");
+        assert_eq!(desugar("x.play(at 5b + 2)"), "play(x, add(at(5b), 2))");
+        assert_eq!(desugar("x.play(at 1bar)"), "play(x, at(4b))");
+        assert_eq!(
+            parse("x.play(at)").unwrap_err().msg,
+            "expected an expression"
+        );
     }
 
     #[test]

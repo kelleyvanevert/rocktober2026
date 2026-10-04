@@ -253,7 +253,8 @@ mod macos {
         h.set_text("sample(\"kick.mp3\").play\nsample(\"kick.mp3\").play\n");
         h.press_at(0, 0, "cmd-shift-enter");
         assert_eq!(h.last_log(), r#"sample("kick.mp3").play …"#);
-        h.press_at(0, 0, "cmd-shift-.");
+        // As the keyboard sends it: shift-. is ">".
+        h.press_at(0, 0, "cmd->");
         assert_eq!(h.last_log(), "stop");
         h.snapshot("4-stop");
 

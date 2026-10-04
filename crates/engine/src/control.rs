@@ -12,6 +12,8 @@ use std::sync::Arc;
 use crate::engine::MAX_BLOCK;
 use crate::envelope::Envelope;
 use crate::modulation::Modulation;
+use crate::noise::random_at;
+use crate::pattern::{Pattern, Step};
 
 pub trait ControlNode: Send {
     /// Write up to `out.len()` values. Returns how many were written; fewer
@@ -190,6 +192,219 @@ impl ControlNode for Combine {
     }
 }
 
+/// A new random value (0..1) every `period` frames, held in between (sample
+/// and hold). The values are a function of the period's number, so a voice
+/// can pick the stream up anywhere, like a modulation. It never finishes.
+pub struct RandomPlayer {
+    seed: u64,
+    period: f64,
+    start: f64,
+    /// Frames from the start of period 0.
+    pos: f64,
+}
+
+impl RandomPlayer {
+    /// Starting `start` frames in.
+    pub fn new(seed: u64, period: f64, start: f64) -> Self {
+        Self {
+            seed,
+            period: period.max(1.0),
+            start,
+            pos: start,
+        }
+    }
+}
+
+impl ControlNode for RandomPlayer {
+    fn process(&mut self, out: &mut [f32]) -> usize {
+        for slot in out.iter_mut() {
+            let k = (self.pos / self.period + 1e-9).floor() as i64;
+            *slot = random_at(self.seed, k) as f32;
+            self.pos += 1.0;
+        }
+        out.len()
+    }
+
+    fn reset(&mut self) {
+        self.pos = self.start;
+    }
+}
+
+/// `x` (0..1) mapped onto `lo..hi`. With `whole`, onto the whole numbers from
+/// `lo` to `hi`, both included and (for a uniform `x`) all equally likely.
+/// Finishes when any of the three does.
+pub struct Range {
+    x: Box<dyn ControlNode>,
+    lo: Box<dyn ControlNode>,
+    hi: Box<dyn ControlNode>,
+    whole: bool,
+    bufs: [Vec<f32>; 2],
+}
+
+impl Range {
+    pub fn new(
+        x: Box<dyn ControlNode>,
+        lo: Box<dyn ControlNode>,
+        hi: Box<dyn ControlNode>,
+        whole: bool,
+    ) -> Self {
+        Self {
+            x,
+            lo,
+            hi,
+            whole,
+            bufs: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
+        }
+    }
+}
+
+impl ControlNode for Range {
+    fn process(&mut self, out: &mut [f32]) -> usize {
+        let mut done = 0;
+        for chunk in out.chunks_mut(MAX_BLOCK) {
+            let n = self.x.process(chunk);
+            let n = self.lo.process(&mut self.bufs[0][..n]);
+            let n = self.hi.process(&mut self.bufs[1][..n]);
+            for (i, x) in chunk[..n].iter_mut().enumerate() {
+                let (lo, hi) = (self.bufs[0][i], self.bufs[1][i]);
+                *x = if self.whole {
+                    let (lo, hi) = (lo.round(), hi.round());
+                    let steps = (hi - lo).abs();
+                    let step = (x.clamp(0.0, 1.0) * (steps + 1.0)).floor().min(steps);
+                    lo + step * (hi - lo).signum()
+                } else {
+                    lo + *x * (hi - lo)
+                };
+            }
+            done += n;
+            if n < chunk.len() {
+                break;
+            }
+        }
+        done
+    }
+
+    fn reset(&mut self) {
+        self.x.reset();
+        self.lo.reset();
+        self.hi.reset();
+    }
+}
+
+/// A function applied to every value.
+pub struct Map {
+    x: Box<dyn ControlNode>,
+    f: fn(f32) -> f32,
+}
+
+impl Map {
+    pub fn new(x: Box<dyn ControlNode>, f: fn(f32) -> f32) -> Self {
+        Self { x, f }
+    }
+}
+
+impl ControlNode for Map {
+    fn process(&mut self, out: &mut [f32]) -> usize {
+        let n = self.x.process(out);
+        for x in &mut out[..n] {
+            *x = (self.f)(*x);
+        }
+        n
+    }
+
+    fn reset(&mut self) {
+        self.x.reset();
+    }
+}
+
+/// The pitch of a gliding phrase: a pattern's notes from step `start` on,
+/// each sliding from where the last one was to its own pitch over `glide`
+/// frames, in a straight line (in notes, so evenly in pitch). Hits without a
+/// note (`x`) keep the pitch where it is. It never finishes; the phrase's
+/// voice is ended by its gate.
+pub struct NotePath {
+    pattern: Arc<Pattern>,
+    start: usize,
+    step_frames: f64,
+    glide: f64,
+    /// Frames since the start.
+    t: f64,
+    /// The step that's playing.
+    step: usize,
+    from: f32,
+    to: f32,
+    /// Frames since the last note.
+    since: f64,
+}
+
+impl NotePath {
+    pub fn new(pattern: Arc<Pattern>, start: usize, step_frames: f64, glide: f64) -> Self {
+        let mut path = Self {
+            pattern,
+            start,
+            step_frames: step_frames.max(1.0),
+            glide,
+            t: 0.0,
+            step: start,
+            from: 0.0,
+            to: 0.0,
+            since: 0.0,
+        };
+        path.reset();
+        path
+    }
+
+    fn value(&self) -> f32 {
+        if self.since >= self.glide {
+            self.to
+        } else {
+            self.from + (self.to - self.from) * (self.since / self.glide) as f32
+        }
+    }
+
+    fn note_at(&self, step: usize) -> Option<f32> {
+        let steps = &self.pattern.steps;
+        match steps[step % steps.len()] {
+            Step::Hit { note: Some(n), .. } => Some(n as f32),
+            _ => None,
+        }
+    }
+}
+
+impl ControlNode for NotePath {
+    fn process(&mut self, out: &mut [f32]) -> usize {
+        for slot in out.iter_mut() {
+            let step = self.start + (self.t / self.step_frames + 1e-9).floor() as usize;
+            while self.step < step {
+                self.step += 1;
+                if let Some(note) = self.note_at(self.step) {
+                    self.from = self.value();
+                    self.to = note;
+                    self.since = 0.0;
+                }
+            }
+            *slot = self.value();
+            self.t += 1.0;
+            self.since += 1.0;
+        }
+        out.len()
+    }
+
+    fn reset(&mut self) {
+        // Starts on its first note (or, if it starts on an `x`, on the first
+        // note it gets to: the pitch is at rest until then).
+        let len = self.pattern.steps.len();
+        let first = (self.start..self.start + len)
+            .find_map(|s| self.note_at(s))
+            .unwrap_or(60.0);
+        self.t = 0.0;
+        self.step = self.start;
+        self.from = first;
+        self.to = first;
+        self.since = self.glide;
+    }
+}
+
 /// A numeric parameter of an audio node: a constant, or a control signal
 /// computed a block at a time.
 pub enum Param {
@@ -344,6 +559,53 @@ mod tests {
         assert_eq!(mul.process(&mut buf), 2000);
         mul.reset();
         assert_eq!(mul.process(&mut buf), 3000);
+    }
+
+    #[test]
+    fn random_holds_each_value_for_a_period() {
+        let out = render(&mut RandomPlayer::new(5, 3.0, 0.0), 9);
+        assert!(out[..3].iter().all(|v| *v == out[0]));
+        assert!(out[3..6].iter().all(|v| *v == out[3]));
+        assert_ne!(out[0], out[3]);
+        // Picked up partway, it's the same stream.
+        let later = render(&mut RandomPlayer::new(5, 3.0, 4.0), 5);
+        assert_eq!(later, out[4..9]);
+    }
+
+    #[test]
+    fn ranges_scale_or_count_whole_numbers() {
+        let ramp = |n: usize| {
+            let m = Arc::new(Modulation {
+                length: n as f64,
+                points: vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)],
+            });
+            Box::new(ModulationPlayer::new(m, 1, 0, 1))
+        };
+        let c = |v| Box::new(Constant(v));
+        let out = render(&mut Range::new(ramp(4), c(10.0), c(20.0), false), 5);
+        assert_eq!(out, [10.0, 12.5, 15.0, 17.5, 20.0]);
+        // 1 to 3 inclusive: thirds of the ramp each, and 3 at the very top.
+        let out = render(&mut Range::new(ramp(6), c(1.0), c(3.0), true), 7);
+        assert_eq!(out, [1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 3.0]);
+        let out = render(&mut Map::new(c(2.6), f32::round), 2);
+        assert_eq!(out, [3.0, 3.0]);
+    }
+
+    #[test]
+    fn note_paths_glide_between_notes() {
+        let pattern = Arc::new(Pattern::parse("c4 _ e4 x", 1.0).unwrap());
+        // Four frames a step, two frames of glide.
+        let out = render(&mut NotePath::new(pattern.clone(), 0, 4.0, 2.0), 16);
+        assert_eq!(
+            out,
+            [
+                60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 62.0, 64.0, 64.0, 64.0, 64.0,
+                64.0, 64.0
+            ]
+        );
+        // From the third step on: starts right on e4.
+        let out = render(&mut NotePath::new(pattern, 2, 4.0, 2.0), 2);
+        assert_eq!(out, [64.0, 64.0]);
     }
 
     #[test]

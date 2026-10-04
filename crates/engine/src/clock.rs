@@ -4,6 +4,27 @@
 /// Beats per bar. Everything is in 4/4 for now.
 pub const BEATS_PER_BAR: f64 = 4.0;
 
+/// Where something may start: every `every` beats, shifted by `offset` beats
+/// (`at 5b + 2` is beats 2, 7, 12, ...). Counted from beat 0, so everything
+/// on the same grid stays in step, however late it's started.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Grid {
+    pub every: f64,
+    pub offset: f64,
+}
+
+impl Grid {
+    pub fn new(every: f64) -> Self {
+        Self { every, offset: 0.0 }
+    }
+
+    /// The first beat on the grid at or after `beat`.
+    pub fn next(&self, beat: f64) -> f64 {
+        let offset = self.offset.rem_euclid(self.every);
+        ((beat - offset) / self.every - 1e-9).ceil() * self.every + offset
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Clock {
     sample_rate: f64,
@@ -53,11 +74,6 @@ impl Clock {
     pub fn seconds(&self, beats: f64) -> f64 {
         beats * 60.0 / self.bpm
     }
-
-    /// The first bar line at or after `frame`.
-    pub fn next_bar(&self, frame: u64) -> f64 {
-        (self.beat_at(frame) / BEATS_PER_BAR - 1e-9).ceil() * BEATS_PER_BAR
-    }
 }
 
 #[cfg(test)]
@@ -69,12 +85,31 @@ mod tests {
         let mut clock = Clock::new(48_000);
         assert_eq!(clock.beat_at(24_000), 1.0);
         assert_eq!(clock.frame_at(4.0), 96_000);
-        assert_eq!(clock.next_bar(1), 4.0);
-        assert_eq!(clock.next_bar(96_000), 4.0);
         // Twice as fast from beat 4 on.
         clock.set_bpm(240.0, 96_000);
         assert_eq!(clock.beat_at(96_000 + 12_000), 5.0);
         assert_eq!(clock.frame_at(8.0), 96_000 + 48_000);
         assert_eq!(clock.seconds(2.0), 0.5);
+    }
+
+    #[test]
+    fn grids() {
+        let bar = Grid::new(4.0);
+        assert_eq!(bar.next(0.0), 0.0);
+        assert_eq!(bar.next(0.1), 4.0);
+        assert_eq!(bar.next(4.0), 4.0);
+        let fives = Grid {
+            every: 5.0,
+            offset: 2.0,
+        };
+        assert_eq!(fives.next(0.0), 2.0);
+        assert_eq!(fives.next(2.5), 7.0);
+        assert_eq!(fives.next(12.0), 12.0);
+        // An offset past the grid wraps around.
+        let late = Grid {
+            every: 4.0,
+            offset: 6.0,
+        };
+        assert_eq!(late.next(0.5), 2.0);
     }
 }

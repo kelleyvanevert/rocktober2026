@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use rtrb::{Consumer, Producer};
 
 use crate::nodes::{Frame, Node};
+use crate::sidechain::Bus;
 
 /// The largest block `Engine::process` handles; the audio callback splits bigger
 /// device buffers into chunks of this size.
@@ -20,6 +21,8 @@ pub const MAX_BLOCK: usize = 1024;
 const MAX_VOICES: usize = 256;
 /// Timed commands waiting for their block.
 const MAX_PENDING: usize = 1024;
+/// Slots that can be ducked under.
+const MAX_BUSES: usize = 32;
 
 /// A named group of voices (see `Session`), so they can be stopped together.
 /// 0 means none.
@@ -39,6 +42,12 @@ pub enum Command {
         at: u64,
     },
     StopAll,
+    /// From now on, copy the level of the voices in `slot` into `bus` (for
+    /// sidechaining, see `sidechain`).
+    Bus {
+        slot: Slot,
+        bus: Arc<Bus>,
+    },
     /// Copy the output (interleaved stereo) into this queue until told to stop.
     StartRecording(Producer<f32>),
     StopRecording,
@@ -83,6 +92,9 @@ pub struct Engine {
     scratch: Vec<Frame>,
     stop_fade: usize,
     recorder: Option<Producer<f32>>,
+    /// The slots whose level is copied to a bus. Their voices are rendered
+    /// first, so the bus is full before anything that listens to it runs.
+    buses: Vec<(Slot, Arc<Bus>)>,
 }
 
 impl Engine {
@@ -103,6 +115,7 @@ impl Engine {
             scratch: vec![[0.0; 2]; MAX_BLOCK],
             stop_fade: (sample_rate as usize / 100).max(1), // 10 ms
             recorder: None,
+            buses: Vec::with_capacity(MAX_BUSES),
         }
     }
 
@@ -117,7 +130,23 @@ impl Engine {
                     let at = at.unwrap_or(0).max(self.frame);
                     self.schedule(at, Pending::Play(node, slot));
                 }
-                Command::StopSlot { slot, at } => self.schedule(at, Pending::Stop(slot)),
+                Command::StopSlot { slot, at } => {
+                    // Voices sent ahead for this slot that would start after
+                    // the stop never start. (What's sent for the slot after
+                    // this command, the replacement, isn't touched.)
+                    let mut i = 0;
+                    while i < self.pending.len() {
+                        match self.pending[i] {
+                            (start, Pending::Play(_, s)) if s == slot && start >= at => {
+                                if let (_, Pending::Play(node, _)) = self.pending.swap_remove(i) {
+                                    self.retire(node);
+                                }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    self.schedule(at, Pending::Stop(slot));
+                }
                 Command::StopAll => {
                     for v in &mut self.voices {
                         v.stopping.get_or_insert(self.stop_fade);
@@ -129,6 +158,13 @@ impl Engine {
                         }
                     }
                 }
+                // The session sends each slot once, and keeps a reference of its
+                // own, so dropping one here (if it's full) never frees it here.
+                Command::Bus { slot, bus } => {
+                    if self.buses.len() < MAX_BUSES && self.buses.iter().all(|(s, _)| *s != slot) {
+                        self.buses.push((slot, bus));
+                    }
+                }
                 Command::StartRecording(producer) => self.recorder = Some(producer),
                 // Dropping our end tells the writer thread to finish the file.
                 Command::StopRecording => self.recorder = None,
@@ -138,33 +174,54 @@ impl Engine {
         self.start_due(len);
 
         out.fill([0.0; 2]);
-        let mut i = 0;
-        while i < self.voices.len() {
-            let voice = &mut self.voices[i];
-            let delay = std::mem::take(&mut voice.delay);
-            let scratch = &mut self.scratch[..len - delay];
-            let n = voice.node.process(scratch);
-            let mut finished = n < len - delay;
-            for (o, s) in out[delay..].iter_mut().zip(&scratch[..n]) {
-                let gain = match &mut voice.stopping {
-                    None => 1.0,
-                    Some(0) => {
-                        finished = true;
-                        break;
-                    }
-                    Some(left) => {
-                        *left -= 1;
-                        *left as f32 / self.stop_fade as f32
-                    }
-                };
-                o[0] += s[0] * gain;
-                o[1] += s[1] * gain;
-            }
-            if finished {
-                let voice = self.voices.swap_remove(i);
-                self.retire(voice.node);
-            } else {
-                i += 1;
+        for (_, bus) in &self.buses {
+            bus.begin(self.frame, len);
+        }
+        // First the voices that feed a bus, then the rest (which may listen).
+        for keyed in [true, false] {
+            let mut i = 0;
+            while i < self.voices.len() {
+                let bus = self.buses.iter().find(|(s, _)| *s == self.voices[i].slot);
+                if bus.is_some() != keyed {
+                    i += 1;
+                    continue;
+                }
+                let voice = &mut self.voices[i];
+                let delay = std::mem::take(&mut voice.delay);
+                let scratch = &mut self.scratch[..len - delay];
+                let n = voice.node.process(scratch);
+                let mut finished = n < len - delay;
+                let start = voice.stopping;
+                let mut played = n;
+                for (j, (o, s)) in out[delay..].iter_mut().zip(&scratch[..n]).enumerate() {
+                    let gain = match &mut voice.stopping {
+                        None => 1.0,
+                        Some(0) => {
+                            finished = true;
+                            played = j;
+                            break;
+                        }
+                        Some(left) => {
+                            *left -= 1;
+                            *left as f32 / self.stop_fade as f32
+                        }
+                    };
+                    o[0] += s[0] * gain;
+                    o[1] += s[1] * gain;
+                }
+                if let Some((_, bus)) = bus {
+                    let fade = self.stop_fade as f32;
+                    bus.add(delay, &scratch[..played], |j| match start {
+                        None => 1.0,
+                        Some(left) => left.saturating_sub(j + 1) as f32 / fade,
+                    });
+                }
+                if finished {
+                    let voice = self.voices.swap_remove(i);
+                    self.retire(voice.node);
+                } else {
+                    i += 1;
+                }
             }
         }
 
@@ -302,6 +359,26 @@ mod tests {
         // In the past: right away.
         let _ = commands.push(play(0));
         assert_eq!(block(&mut engine)[0], 1.0);
+    }
+
+    #[test]
+    fn stopping_a_slot_cancels_what_was_sent_ahead() {
+        let (mut engine, mut commands) = engine();
+        let play = |at| Command::Play {
+            node: Box::new(Ones),
+            at: Some(at),
+            slot: 1,
+        };
+        let _ = commands.push(play(150));
+        let _ = commands.push(play(50));
+        let _ = commands.push(Command::StopSlot { slot: 1, at: 100 });
+        let _ = commands.push(play(100));
+        let first = block(&mut engine);
+        assert_eq!(first[60], 0.5, "starts before the stop");
+        let second = block(&mut engine);
+        // The one at 50 fades out at 100, the replacement starts at 100, and
+        // the one at 150 never does.
+        assert_eq!(second[60], 0.5);
     }
 
     #[test]

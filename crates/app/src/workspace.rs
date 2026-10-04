@@ -27,7 +27,7 @@ const MAX_LOG_ENTRIES: usize = 500;
 
 const EXAMPLE: &str = r#"-- cmd-enter       run the selection, or the block under the cursor
 -- cmd-shift-enter run everything
--- cmd-.           stop what the block plays into named slots (on the next bar)
+-- cmd-.           stop what the block plays into named slots
 -- cmd-shift-.     stop all sound
 -- cmd-r           start/stop recording to recordings/
 
@@ -47,13 +47,17 @@ add(
   sample("kick.mp3").fit(125ms).repeat(8),
 ).limit.play
 
--- everything starts on the next bar; a named slot replaces what played there
+-- play starts right away, play(at 1bar) on the next bar (at 4b, at 5b + 2,
+-- ...: any grid of beats); a named slot replaces what played there
 120.bpm
 
-notes("x . x . x x . .", 0.25b).play(sample("kick.mp3"), "drums")
+notes("x . x . x x . .", 0.25b).play(sample("kick.mp3"), "drums", at 1bar)
 
 let lead = wavetable("basic", ?pos = 0.3, 0.2, ?note) * 0.5
-notes("c3 e3 g3 _ b3 . g3 e3", 0.25b).play(lead, "lead")
+notes("c3 e3 g3 _ b3 . g3 e3", 0.25b).play(lead.duck("drums"), "lead", at 1bar)
+
+-- noise, filters (cutoffs are pitches: 800hz, c6, ?note + 24), space
+noise("pink").bandpass(2khz, 0.6).fit(1b).echo(0.75b, 0.6).spread.pan(-0.5).play
 "#;
 
 #[derive(Clone, Copy, PartialEq)]

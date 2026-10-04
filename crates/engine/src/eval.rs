@@ -21,18 +21,25 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use crate::bundle::Bundle;
-use crate::clock::Clock;
-use crate::control::{self, Combine, ControlNode, EnvelopePlayer, ModulationPlayer, Param};
+use crate::clock::{Clock, Grid};
+use crate::control::{
+    self, Combine, ControlNode, EnvelopePlayer, Map, ModulationPlayer, NotePath, Param,
+    RandomPlayer, Range,
+};
 use crate::envelope::Envelope;
-use crate::lang::{Error, Expr, Spanned};
+use crate::filter::{self, Filter};
+use crate::fx::{Echo, EchoParams, Pan, Spread};
+use crate::lang::{Error, Expr, Spanned, hz_to_note};
 use crate::modulation::Modulation;
 use crate::nodes::{
     Add, Delay, Fit, Gain, Limit, Multiply, Node, Repeat, SampleData, Sampler, Seq, Slice,
 };
+use crate::noise::{self, Noise};
 use crate::pattern::Pattern;
 use crate::resource::ResourceKind;
 use crate::reverb::{self, Impulse, MAX_IR_SECONDS, Reverb};
 use crate::sample;
+use crate::sidechain::{Bus, Duck};
 use crate::wavetable::{self, Oscillator, Wavetable};
 
 /// Fade-out applied where `fit` cuts a sound off. A few ms is enough to remove the
@@ -48,37 +55,82 @@ const LIMIT_RELEASE_SECONDS: f64 = 0.1;
 /// Default `reverb` wet/dry mix.
 const REVERB_MIX: f64 = 0.3;
 
+/// `spread` default amount.
+const SPREAD: f64 = 0.5;
+/// `echo` defaults: feedback, wet/dry mix, and the band the repeats are
+/// filtered to.
+const ECHO_FEEDBACK: f64 = 0.5;
+const ECHO_MIX: f64 = 0.35;
+const ECHO_LOW_HZ: f64 = 80.0;
+const ECHO_HIGH_HZ: f64 = 10_000.0;
+/// `duck` defaults: how far down, and how long it takes to come back up.
+const DUCK_AMOUNT: f64 = 0.8;
+const DUCK_RELEASE_SECONDS: f64 = 0.15;
+/// The highest plain number taken as a cutoff pitch: above this it's surely
+/// meant as Hz.
+const MAX_CUTOFF_NOTE: f64 = 140.0;
+
 /// What running code asks the session to do. Timing is the session's
-/// business: it starts things on the next bar.
+/// business: it starts things right away, or on the next point of a grid.
 pub enum Action {
     /// Play a sound. With a slot name, it replaces what's playing in that slot.
     Play {
         sound: Sound,
         slot: Option<String>,
+        at: Option<Grid>,
     },
     /// Play a pattern of notes with an instrument (see `Sound::for_note`).
     Pattern {
         pattern: Arc<Pattern>,
         instrument: Sound,
         slot: Option<String>,
+        at: Option<Grid>,
     },
     Bpm(f64),
     StopAll,
 }
 
+/// A grid written out literally, like `at 4b` or `at 5b + 2`.
+fn literal_grid(e: &Expr) -> Option<Grid> {
+    let Expr::Call { name, args } = e else {
+        return None;
+    };
+    match (name.as_str(), args.as_slice()) {
+        ("at", [every]) => match every.expr {
+            Expr::Beats(b) if b > 0.0 => Some(Grid::new(b)),
+            _ => None,
+        },
+        ("add", [grid, offset]) => {
+            let grid = literal_grid(&grid.expr)?;
+            match offset.expr {
+                Expr::Beats(b) | Expr::Num(b) => Some(Grid {
+                    offset: grid.offset + b,
+                    ..grid
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// The slots a program plays into by name, like `.play("drums")` or
-/// `.play(lead, "lead")`, found by reading the code rather than running it: a
-/// call of `play` whose last argument (of at least two) is a string.
-pub fn named_slots(program: &[Spanned]) -> Vec<String> {
-    fn walk(e: &Spanned, out: &mut Vec<String>) {
+/// `.play(lead, "lead", at 1bar)`, and the grid they start on (if it's
+/// written out), found by reading the code rather than running it: a call of
+/// `play` with a string among its arguments after the first.
+pub fn named_slots(program: &[Spanned]) -> Vec<(String, Option<Grid>)> {
+    fn walk(e: &Spanned, out: &mut Vec<(String, Option<Grid>)>) {
         match &e.expr {
             Expr::Call { name, args } => {
                 if name == "play"
-                    && args.len() >= 2
-                    && let Some(Expr::Str(slot)) = args.last().map(|a| &a.expr)
-                    && !out.contains(slot)
+                    && let Some(slot) = args.iter().skip(1).find_map(|a| match &a.expr {
+                        Expr::Str(slot) => Some(slot),
+                        _ => None,
+                    })
+                    && !out.iter().any(|(s, _)| s == slot)
                 {
-                    out.push(slot.clone());
+                    let grid = args.iter().skip(1).find_map(|a| literal_grid(&a.expr));
+                    out.push((slot.clone(), grid));
                 }
                 for arg in args {
                     walk(arg, out);
@@ -121,6 +173,35 @@ pub enum Sound {
         /// A MIDI note number.
         pitch: Control,
     },
+    Noise(noise::Color),
+    Filter {
+        kind: filter::Kind,
+        /// A pitch.
+        cutoff: Control,
+        resonance: Control,
+        child: Box<Sound>,
+    },
+    Pan(Control, Box<Sound>),
+    Spread(Control, Box<Sound>),
+    Echo {
+        child: Box<Sound>,
+        /// Seconds.
+        time: f64,
+        feedback: Control,
+        mix: Control,
+        /// The band the repeats are filtered to, as pitches.
+        low: Control,
+        high: Control,
+        pingpong: bool,
+    },
+    /// Turned down while what plays on the bus sounds.
+    Duck {
+        child: Box<Sound>,
+        bus: Arc<Bus>,
+        amount: Control,
+        /// Seconds.
+        release: f64,
+    },
 }
 
 impl Sound {
@@ -160,27 +241,75 @@ impl Sound {
                 warp: f(warp),
                 pitch: f(pitch),
             },
+            Sound::Noise(color) => Sound::Noise(*color),
+            Sound::Filter {
+                kind,
+                cutoff,
+                resonance,
+                child,
+            } => Sound::Filter {
+                kind: *kind,
+                cutoff: f(cutoff),
+                resonance: f(resonance),
+                child: Box::new(child.map_controls(f)),
+            },
+            Sound::Pan(position, child) => {
+                let position = f(position);
+                Sound::Pan(position, Box::new(child.map_controls(f)))
+            }
+            Sound::Spread(amount, child) => {
+                let amount = f(amount);
+                Sound::Spread(amount, Box::new(child.map_controls(f)))
+            }
+            Sound::Echo {
+                child,
+                time,
+                feedback,
+                mix,
+                low,
+                high,
+                pingpong,
+            } => Sound::Echo {
+                feedback: f(feedback),
+                mix: f(mix),
+                low: f(low),
+                high: f(high),
+                child: Box::new(child.map_controls(f)),
+                time: *time,
+                pingpong: *pingpong,
+            },
+            Sound::Duck {
+                child,
+                bus,
+                amount,
+                release,
+            } => Sound::Duck {
+                amount: f(amount),
+                child: Box::new(child.map_controls(f)),
+                bus: bus.clone(),
+                release: *release,
+            },
         }
     }
 
-    /// The voice for one note of a pattern: `?note` filled in, envelopes
-    /// released after `gate` seconds, and free-running modulations picked up
-    /// where they are `since` seconds into the pattern. A sound that would go
-    /// on forever and has no envelope to end it is cut off at the gate.
-    pub fn for_note(&self, note: Option<f64>, gate: f64, since: f64) -> Sound {
+    /// The voice for one note of a pattern: `?note` filled in (with a
+    /// pitch, or a gliding `NotePath`), envelopes released after `gate`
+    /// seconds (`None`: never), and free-running modulations picked up where
+    /// they are `since` seconds into the pattern. A sound that would go on
+    /// forever and has no envelope to end it is cut off at the gate.
+    pub fn for_note(&self, note: Option<Control>, gate: Option<f64>, since: f64) -> Sound {
         let mut values = HashMap::new();
         if let Some(note) = note {
-            values.insert("note".to_string(), Control::Constant(note));
+            values.insert("note".to_string(), note);
         }
         let mut has_envelope = false;
         let voice = self.map_controls(&mut |c| {
             has_envelope |= c.has_envelope();
             c.fill(&values).for_note(gate, since)
         });
-        if !has_envelope && voice.is_endless() {
-            Sound::Fit(Box::new(voice), gate)
-        } else {
-            voice
+        match gate {
+            Some(gate) if !has_envelope && voice.is_endless() => Sound::Fit(Box::new(voice), gate),
+            _ => voice,
         }
     }
 
@@ -189,14 +318,19 @@ impl Sound {
     fn is_endless(&self) -> bool {
         match self {
             Sound::Sample(_) | Sound::Fit(..) | Sound::Slice(..) => false,
-            Sound::Wavetable { .. } => true,
+            Sound::Wavetable { .. } | Sound::Noise(_) => true,
             Sound::Repeat(child, times) => *times == usize::MAX || child.is_endless(),
             Sound::Add(children) | Sound::Seq(children) => children.iter().any(Sound::is_endless),
             Sound::Multiply(a, b) => a.is_endless() && b.is_endless(),
             Sound::Delay(child, _)
             | Sound::Gain(_, child)
             | Sound::Limit(_, child)
-            | Sound::Reverb(child, ..) => child.is_endless(),
+            | Sound::Reverb(child, ..)
+            | Sound::Filter { child, .. }
+            | Sound::Pan(_, child)
+            | Sound::Spread(_, child)
+            | Sound::Echo { child, .. }
+            | Sound::Duck { child, .. } => child.is_endless(),
         }
     }
 
@@ -274,6 +408,60 @@ impl Sound {
                 pitch.param(sample_rate),
                 sample_rate,
             )),
+            Sound::Noise(color) => Box::new(Noise::new(*color, noise::next_seed())),
+            Sound::Filter {
+                kind,
+                cutoff,
+                resonance,
+                child,
+            } => Box::new(Filter::new(
+                child.instantiate(sample_rate),
+                *kind,
+                cutoff.param(sample_rate),
+                resonance.param(sample_rate),
+                sample_rate,
+            )),
+            Sound::Pan(position, child) => Box::new(Pan::new(
+                child.instantiate(sample_rate),
+                position.param(sample_rate),
+            )),
+            Sound::Spread(amount, child) => Box::new(Spread::new(
+                child.instantiate(sample_rate),
+                amount.param(sample_rate),
+                sample_rate,
+            )),
+            Sound::Echo {
+                child,
+                time,
+                feedback,
+                mix,
+                low,
+                high,
+                pingpong,
+            } => Box::new(Echo::new(
+                child.instantiate(sample_rate),
+                frames(*time),
+                EchoParams {
+                    feedback: feedback.param(sample_rate),
+                    mix: mix.param(sample_rate),
+                    low: low.param(sample_rate),
+                    high: high.param(sample_rate),
+                    pingpong: *pingpong,
+                },
+                sample_rate,
+            )),
+            Sound::Duck {
+                child,
+                bus,
+                amount,
+                release,
+            } => Box::new(Duck::new(
+                child.instantiate(sample_rate),
+                bus.clone(),
+                amount.param(sample_rate),
+                *release as f32,
+                sample_rate,
+            )),
         }
     }
 }
@@ -301,10 +489,34 @@ pub enum Control {
         clock: ModClock,
         start: f64,
     },
+    /// A new random value every `period` seconds, starting `start` seconds in.
+    Random {
+        period: f64,
+        seed: u64,
+        clock: ModClock,
+        start: f64,
+    },
     /// Released after the gate (in seconds), if it has one.
     Envelope(Arc<Envelope>, Option<f64>),
     Mul(Box<Control>, Box<Control>),
     Add(Box<Control>, Box<Control>),
+    /// The first mapped from 0..1 onto the other two (whole numbers only, if
+    /// `whole`).
+    Range {
+        x: Box<Control>,
+        lo: Box<Control>,
+        hi: Box<Control>,
+        whole: bool,
+    },
+    Round(Box<Control>),
+    /// The pitch of a gliding phrase of a pattern (see `NotePath`): from step
+    /// `start`, with steps and glide in seconds.
+    NotePath {
+        pattern: Arc<Pattern>,
+        start: usize,
+        step: f64,
+        glide: f64,
+    },
     /// `?name`, filled in by `with`. Unfilled, it's its default (or 0, but
     /// `play` refuses holes without one).
     Hole {
@@ -314,32 +526,59 @@ pub enum Control {
 }
 
 impl Control {
+    /// The controls this one is made of.
+    fn children(&self) -> Vec<&Control> {
+        match self {
+            Control::Mul(a, b) | Control::Add(a, b) => vec![a, b],
+            Control::Range { x, lo, hi, .. } => vec![x, lo, hi],
+            Control::Round(x) => vec![x],
+            Control::Hole {
+                default: Some(d), ..
+            } => vec![d],
+            _ => vec![],
+        }
+    }
+
+    /// The same control with each of its children replaced by `f(child)`.
+    fn map_children(&self, f: &mut dyn FnMut(&Control) -> Control) -> Control {
+        let mut m = |c: &Control| Box::new(f(c));
+        match self {
+            Control::Mul(a, b) => Control::Mul(m(a), m(b)),
+            Control::Add(a, b) => Control::Add(m(a), m(b)),
+            Control::Range { x, lo, hi, whole } => Control::Range {
+                x: m(x),
+                lo: m(lo),
+                hi: m(hi),
+                whole: *whole,
+            },
+            Control::Round(x) => Control::Round(m(x)),
+            Control::Hole {
+                name,
+                default: Some(d),
+            } => Control::Hole {
+                name: name.clone(),
+                default: Some(m(d)),
+            },
+            other => other.clone(),
+        }
+    }
+
     fn holes(&self, out: &mut Vec<(String, bool)>) {
         match self {
+            // A default's own holes aren't the instrument's to fill.
             Control::Hole { name, default } => out.push((name.clone(), default.is_some())),
-            Control::Mul(a, b) | Control::Add(a, b) => {
-                a.holes(out);
-                b.holes(out);
-            }
-            _ => {}
+            other => other.children().iter().for_each(|c| c.holes(out)),
         }
     }
 
     fn has_envelope(&self) -> bool {
-        match self {
-            Control::Envelope(..) => true,
-            Control::Mul(a, b) | Control::Add(a, b) => a.has_envelope() || b.has_envelope(),
-            Control::Hole {
-                default: Some(d), ..
-            } => d.has_envelope(),
-            _ => false,
-        }
+        matches!(self, Control::Envelope(..)) || self.children().iter().any(|c| c.has_envelope())
     }
 
     /// See `Sound::for_note`.
-    fn for_note(&self, gate: f64, since: f64) -> Control {
+    fn for_note(&self, gate: Option<f64>, since: f64) -> Control {
         match self {
-            Control::Envelope(env, None) => Control::Envelope(env.clone(), Some(gate)),
+            Control::Envelope(env, None) => Control::Envelope(env.clone(), gate),
             Control::Modulation {
                 data,
                 times,
@@ -355,27 +594,37 @@ impl Control {
                 },
                 ModClock::Latch => Control::Constant(data.value_after(start + since, *times)),
             },
-            Control::Mul(a, b) => Control::Mul(
-                Box::new(a.for_note(gate, since)),
-                Box::new(b.for_note(gate, since)),
-            ),
-            Control::Add(a, b) => Control::Add(
-                Box::new(a.for_note(gate, since)),
-                Box::new(b.for_note(gate, since)),
-            ),
-            Control::Hole {
-                name,
-                default: Some(d),
-            } => Control::Hole {
-                name: name.clone(),
-                default: Some(Box::new(d.for_note(gate, since))),
+            Control::Random {
+                period,
+                seed,
+                clock,
+                start,
+            } => match clock {
+                // Starting over with the same values every note would be the
+                // same note every time: a new stream per note instead.
+                ModClock::Retrig => Control::Random {
+                    period: *period,
+                    seed: noise::mix(seed ^ since.to_bits()),
+                    clock: *clock,
+                    start: *start,
+                },
+                ModClock::Free => Control::Random {
+                    period: *period,
+                    seed: *seed,
+                    clock: *clock,
+                    start: start + since,
+                },
+                ModClock::Latch => Control::Constant(noise::random_at(
+                    *seed,
+                    ((start + since) / period + 1e-9).floor() as i64,
+                )),
             },
-            other => other.clone(),
+            other => other.map_children(&mut |c| c.for_note(gate, since)),
         }
     }
 
-    /// The same control with every modulation in it following `clock`, or
-    /// `None` if there are no modulations in it.
+    /// The same control with every modulation and random in it following
+    /// `clock`, or `None` if there are none in it.
     fn with_clock(&self, clock: ModClock) -> Option<Control> {
         match self {
             Control::Modulation {
@@ -386,19 +635,28 @@ impl Control {
                 clock,
                 start: *start,
             }),
-            Control::Mul(a, b) | Control::Add(a, b) => {
-                let (a2, b2) = (a.with_clock(clock), b.with_clock(clock));
-                if a2.is_none() && b2.is_none() {
-                    return None;
-                }
-                let a = Box::new(a2.unwrap_or_else(|| (**a).clone()));
-                let b = Box::new(b2.unwrap_or_else(|| (**b).clone()));
-                Some(match self {
-                    Control::Mul(..) => Control::Mul(a, b),
-                    _ => Control::Add(a, b),
-                })
+            Control::Random {
+                period,
+                seed,
+                start,
+                ..
+            } => Some(Control::Random {
+                period: *period,
+                seed: *seed,
+                clock,
+                start: *start,
+            }),
+            other => {
+                let mut changed = false;
+                let control = other.map_children(&mut |c| match c.with_clock(clock) {
+                    Some(c) => {
+                        changed = true;
+                        c
+                    }
+                    None => c.clone(),
+                });
+                changed.then_some(control)
             }
-            _ => None,
         }
     }
 
@@ -406,19 +664,19 @@ impl Control {
     fn fill(&self, values: &HashMap<String, Control>) -> Control {
         match self {
             Control::Hole { name, .. } if values.contains_key(name) => values[name].clone(),
-            Control::Mul(a, b) => Control::Mul(Box::new(a.fill(values)), Box::new(b.fill(values))),
-            Control::Add(a, b) => Control::Add(Box::new(a.fill(values)), Box::new(b.fill(values))),
-            other => other.clone(),
+            Control::Hole { .. } => self.clone(),
+            other => other.map_children(&mut |c| c.fill(values)),
         }
     }
 
     pub fn instantiate(&self, sample_rate: u32) -> Box<dyn ControlNode> {
+        let rate = sample_rate as f64;
         match self {
             Control::Constant(v) => Box::new(control::Constant(*v as f32)),
             Control::Modulation {
                 data, times, start, ..
             } => {
-                let start = (start * sample_rate as f64).round() as usize;
+                let start = (start * rate).round() as usize;
                 Box::new(ModulationPlayer::new(
                     data.clone(),
                     *times,
@@ -426,8 +684,14 @@ impl Control {
                     sample_rate,
                 ))
             }
+            Control::Random {
+                period,
+                seed,
+                start,
+                ..
+            } => Box::new(RandomPlayer::new(*seed, period * rate, start * rate)),
             Control::Envelope(env, gate) => {
-                let gate = gate.map(|seconds| (seconds * sample_rate as f64).round() as usize);
+                let gate = gate.map(|seconds| (seconds * rate).round() as usize);
                 Box::new(EnvelopePlayer::new(env.clone(), gate, sample_rate))
             }
             Control::Mul(a, b) => Box::new(Combine::new(
@@ -439,6 +703,24 @@ impl Control {
                 a.instantiate(sample_rate),
                 b.instantiate(sample_rate),
                 |a, b| a + b,
+            )),
+            Control::Range { x, lo, hi, whole } => Box::new(Range::new(
+                x.instantiate(sample_rate),
+                lo.instantiate(sample_rate),
+                hi.instantiate(sample_rate),
+                *whole,
+            )),
+            Control::Round(x) => Box::new(Map::new(x.instantiate(sample_rate), f32::round)),
+            Control::NotePath {
+                pattern,
+                start,
+                step,
+                glide,
+            } => Box::new(NotePath::new(
+                pattern.clone(),
+                *start,
+                step * rate,
+                glide * rate,
             )),
             Control::Hole { default, .. } => match default {
                 Some(default) => default.instantiate(sample_rate),
@@ -473,6 +755,8 @@ pub enum Type {
     String,
     /// `name: value`, for `with`.
     Binding,
+    /// `at 4b`: where things may start.
+    Grid,
     Nothing,
 }
 
@@ -489,6 +773,7 @@ impl Type {
             Type::Pitch => "a pitch",
             Type::String => "a string",
             Type::Binding => "a binding (like pos: 0.2)",
+            Type::Grid => "a start grid (like at 4b)",
             Type::Nothing => "nothing",
         }
     }
@@ -507,6 +792,7 @@ enum Value {
     Pitch(f64),
     Pattern(Arc<Pattern>),
     Binding(String, Box<Value>),
+    Grid(Grid),
     Nothing,
 }
 
@@ -523,6 +809,7 @@ impl Value {
             Value::Pattern(_) => Type::Pattern,
             Value::Pitch(_) => Type::Pitch,
             Value::Binding(..) => Type::Binding,
+            Value::Grid(_) => Type::Grid,
             Value::Nothing => Type::Nothing,
         }
     }
@@ -591,6 +878,9 @@ const CONTROL: P = P(Type::Control, "a control");
 const NUMBER: P = P(Type::Number, "a number");
 const NAME: P = P(Type::String, "a file name");
 const SLOT: P = P(Type::String, "a slot name (like \"drums\")");
+const GRID: P = P(Type::Grid, "a start grid (like at 4b)");
+const PATTERN: P = P(Type::Pattern, "a pattern or a sound");
+const MODULATION: P = P(Type::Control, "a modulation or a random");
 
 /// A built-in function signature.
 struct Builtin {
@@ -675,9 +965,36 @@ impl Call<'_> {
         }
     }
 
-    /// The slot name in argument `i`, if it's there.
-    fn slot(&self, i: usize) -> Option<String> {
-        self.args.get(i).map(|v| v.str().to_string())
+    /// The slot name and start grid among the arguments from `i` on.
+    fn slot_and_grid(&self, i: usize) -> (Option<String>, Option<Grid>) {
+        let mut found = (None, None);
+        for arg in self.args.iter().skip(i) {
+            match arg {
+                Value::Str(s) => found.0 = Some(s.clone()),
+                Value::Grid(g) => found.1 = Some(*g),
+                _ => unreachable!("not a slot or grid"),
+            }
+        }
+        found
+    }
+
+    /// Argument `i` as a control, or `default` if it isn't there.
+    fn control_or(&self, i: usize, default: f64) -> Control {
+        self.args
+            .get(i)
+            .map_or(Control::Constant(default), Value::control)
+    }
+
+    /// Argument `i` as a cutoff pitch. A plain number too high to be a note
+    /// was surely meant in Hz.
+    fn cutoff(&self, i: usize) -> Result<Control, Error> {
+        match self.args[i] {
+            Value::Num(n) if n > MAX_CUTOFF_NOTE => Err(self.fail(
+                i,
+                format!("a cutoff is a pitch: {n} would be note {n} (did you mean {n}hz?)"),
+            )),
+            _ => Ok(self.control(i)),
+        }
     }
 }
 
@@ -701,8 +1018,62 @@ fn no_value(c: &Call, name: &str) -> Error {
 fn set_clock(c: &Call, clock: ModClock) -> Result<Value, Error> {
     match c.control(0).with_clock(clock) {
         Some(control) => Ok(Value::Control(control)),
-        None => Err(c.wrong(0, "a modulation")),
+        None => Err(c.wrong(0, "a modulation or a random")),
     }
+}
+
+fn play_sound(_: &mut Evaluator, c: &mut Call) -> Result<Value, Error> {
+    if let Some(name) = unfilled(&c.sound(0), "") {
+        return Err(no_value(c, &name));
+    }
+    let sound = c.sound(0);
+    let (slot, at) = c.slot_and_grid(1);
+    c.actions.push(Action::Play { sound, slot, at });
+    Ok(Value::Nothing)
+}
+
+fn play_pattern(_: &mut Evaluator, c: &mut Call) -> Result<Value, Error> {
+    let (pattern, instrument) = (c.args[0].pattern(), c.sound(1));
+    if let Some(name) = unfilled(&instrument, "note") {
+        return Err(no_value(c, &name));
+    }
+    let note = instrument
+        .holes()
+        .into_iter()
+        .find(|(name, _)| name == "note");
+    if pattern.has_notes() && note.is_none() {
+        return Err(c.fail(
+            1,
+            "the sound has no ?note for the pattern's notes (use x for hits without one)",
+        ));
+    }
+    if pattern.has_unpitched_hits() && note.is_some_and(|(_, default)| !default) {
+        return Err(c.fail(
+            1,
+            "the pattern has hits without a note (x), but ?note has no default",
+        ));
+    }
+    let (slot, at) = c.slot_and_grid(2);
+    c.actions.push(Action::Pattern {
+        pattern,
+        instrument,
+        slot,
+        at,
+    });
+    Ok(Value::Nothing)
+}
+
+fn grid_offset(_: &mut Evaluator, c: &mut Call) -> Result<Value, Error> {
+    let Value::Grid(grid) = c.args[0] else {
+        unreachable!()
+    };
+    let (Value::Beats(offset) | Value::Num(offset)) = c.args[1] else {
+        unreachable!()
+    };
+    Ok(Value::Grid(Grid {
+        offset: grid.offset + offset,
+        ..grid
+    }))
 }
 
 fn sound(s: Sound) -> Result<Value, Error> {
@@ -740,48 +1111,38 @@ fn builtins() -> Vec<Builtin> {
     const BINDING: P = P(Type::Binding, "a binding (like pos: 0.2)");
 
     vec![
-        // Starts on the next bar. A named slot replaces what played in it.
-        builtin("play", &[SOUND, SLOT], 1, |_, c| {
-            if let Some(name) = unfilled(&c.sound(0), "") {
-                return Err(no_value(c, &name));
-            }
-            let (sound, slot) = (c.sound(0), c.slot(1));
-            c.actions.push(Action::Play { sound, slot });
-            Ok(Value::Nothing)
-        }),
+        // Starts right away, or on the next point of the grid. A named slot
+        // replaces what played in it.
+        builtin("play", &[SOUND, SLOT, GRID], 1, play_sound),
+        builtin("play", &[SOUND, GRID], 2, play_sound),
+        builtin("play", &[PATTERN, SOUND, SLOT, GRID], 2, play_pattern),
+        builtin("play", &[PATTERN, SOUND, GRID], 3, play_pattern),
         builtin(
-            "play",
-            &[P(Type::Pattern, "a pattern or a sound"), SOUND, SLOT],
-            2,
+            "at",
+            &[P(Type::Beats, "a grid size in beats (like 4b)")],
+            1,
             |_, c| {
-                let (pattern, instrument) = (c.args[0].pattern(), c.sound(1));
-                if let Some(name) = unfilled(&instrument, "note") {
-                    return Err(no_value(c, &name));
+                let Value::Beats(every) = c.args[0] else {
+                    unreachable!()
+                };
+                if every <= 0.0 {
+                    return Err(c.wrong(0, "a grid size above 0 beats"));
                 }
-                let note = instrument
-                    .holes()
-                    .into_iter()
-                    .find(|(name, _)| name == "note");
-                if pattern.has_notes() && note.is_none() {
-                    return Err(c.fail(
-                        1,
-                        "the sound has no ?note for the pattern's notes (use x for hits without one)",
-                    ));
-                }
-                if pattern.has_unpitched_hits() && note.is_some_and(|(_, default)| !default) {
-                    return Err(c.fail(
-                        1,
-                        "the pattern has hits without a note (x), but ?note has no default",
-                    ));
-                }
-                let slot = c.slot(2);
-                c.actions.push(Action::Pattern {
-                    pattern,
-                    instrument,
-                    slot,
-                });
-                Ok(Value::Nothing)
+                Ok(Value::Grid(Grid::new(every)))
             },
+        ),
+        // `at 5b + 2`: an offset into the grid, in beats.
+        builtin(
+            "add",
+            &[GRID, P(Type::Beats, "an offset in beats (like 2b)")],
+            2,
+            grid_offset,
+        ),
+        builtin(
+            "add",
+            &[GRID, P(Type::Number, "an offset in beats (like 2b)")],
+            2,
+            grid_offset,
         ),
         builtin("stop", &[], 0, |_, c| {
             c.actions.push(Action::StopAll);
@@ -821,13 +1182,13 @@ fn builtins() -> Vec<Builtin> {
                 }
             },
         ),
-        builtin("retrig", &[P(Type::Control, "a modulation")], 1, |_, c| {
+        builtin("retrig", &[MODULATION], 1, |_, c| {
             set_clock(c, ModClock::Retrig)
         }),
-        builtin("latch", &[P(Type::Control, "a modulation")], 1, |_, c| {
+        builtin("latch", &[MODULATION], 1, |_, c| {
             set_clock(c, ModClock::Latch)
         }),
-        builtin("free", &[P(Type::Control, "a modulation")], 1, |_, c| {
+        builtin("free", &[MODULATION], 1, |_, c| {
             set_clock(c, ModClock::Free)
         }),
         builtin("sample", &[NAME, START, END], 1, |ev, c| {
@@ -1070,7 +1431,179 @@ fn builtins() -> Vec<Builtin> {
                 reverb_with(c, impulse)
             },
         ),
+        builtin(
+            "noise",
+            &[P(
+                Type::String,
+                "a noise color (white, pink, brown, blue or violet)",
+            )],
+            0,
+            |_, c| {
+                let Some(name) = c.args.first().map(Value::str) else {
+                    return sound(Sound::Noise(noise::Color::White));
+                };
+                match noise::Color::from_name(name) {
+                    Some(color) => sound(Sound::Noise(color)),
+                    None => Err(c.fail(
+                        0,
+                        format!(
+                            "unknown color \"{name}\" (try {})",
+                            noise::Color::NAMES.join(", ")
+                        ),
+                    )),
+                }
+            },
+        ),
+        builtin("lowpass", FILTER, 2, |_, c| {
+            filter_with(c, filter::Kind::Lowpass)
+        }),
+        builtin("highpass", FILTER, 2, |_, c| {
+            filter_with(c, filter::Kind::Highpass)
+        }),
+        builtin("bandpass", FILTER, 2, |_, c| {
+            filter_with(c, filter::Kind::Bandpass)
+        }),
+        builtin(
+            "pan",
+            &[SOUND, P(Type::Control, "a position (-1 is left, 1 right)")],
+            2,
+            |_, c| sound(Sound::Pan(c.control(1), Box::new(c.sound(0)))),
+        ),
+        builtin(
+            "spread",
+            &[SOUND, P(Type::Control, "an amount (0 to 1)")],
+            1,
+            |_, c| sound(Sound::Spread(c.control_or(1, SPREAD), Box::new(c.sound(0)))),
+        ),
+        builtin("echo", ECHO, 2, |_, c| echo_with(c, false)),
+        builtin("pingpong", ECHO, 2, |_, c| echo_with(c, true)),
+        builtin(
+            "duck",
+            &[
+                SOUND,
+                P(Type::String, "the slot to duck under (like \"kick\")"),
+                P(Type::Control, "an amount (0 to 1)"),
+                P(Type::Duration, "a release time (like 150ms)"),
+            ],
+            2,
+            |ev, c| {
+                let release = if c.args.len() > 3 {
+                    c.duration(3)
+                } else {
+                    DUCK_RELEASE_SECONDS
+                };
+                sound(Sound::Duck {
+                    child: Box::new(c.sound(0)),
+                    bus: ev.bus(c.args[1].str()),
+                    amount: c.control_or(2, DUCK_AMOUNT),
+                    release,
+                })
+            },
+        ),
+        builtin(
+            "random",
+            &[P(Type::Duration, "how often it changes (like 1b)")],
+            1,
+            |_, c| {
+                let period = c.duration(0);
+                if period <= 0.0 {
+                    return Err(c.wrong(0, "a period above 0"));
+                }
+                control(Control::Random {
+                    period,
+                    seed: noise::next_seed(),
+                    clock: ModClock::Free,
+                    start: 0.0,
+                })
+            },
+        ),
+        // Whole notes only between two pitches: `range(a3, c4)` is a3, a#3,
+        // b3 or c4.
+        builtin(
+            "range",
+            &[
+                CONTROL,
+                P(Type::Control, "a lowest value"),
+                P(Type::Control, "a highest value"),
+            ],
+            3,
+            |_, c| {
+                let whole = matches!((&c.args[1], &c.args[2]), (Value::Pitch(_), Value::Pitch(_)));
+                control(Control::Range {
+                    x: Box::new(c.control(0)),
+                    lo: Box::new(c.control(1)),
+                    hi: Box::new(c.control(2)),
+                    whole,
+                })
+            },
+        ),
+        builtin("round", &[CONTROL], 1, |_, c| {
+            control(Control::Round(Box::new(c.control(0))))
+        }),
+        builtin(
+            "glide",
+            &[
+                P(Type::Pattern, "a pattern"),
+                P(Type::Duration, "a glide time (like 150ms)"),
+            ],
+            2,
+            |_, c| {
+                let mut pattern = (*c.args[0].pattern()).clone();
+                pattern.glide = Some(c.duration(1).max(0.0));
+                Ok(Value::Pattern(Arc::new(pattern)))
+            },
+        ),
     ]
+}
+
+const FILTER: &[P] = &[
+    SOUND,
+    P(Type::Control, "a cutoff (like 800hz or c6)"),
+    P(Type::Control, "a resonance (0 to 1)"),
+];
+
+const ECHO: &[P] = &[
+    SOUND,
+    P(Type::Duration, "a delay time (like 0.75b)"),
+    P(Type::Control, "a feedback amount (0 to 1)"),
+    P(Type::Control, "a mix between 0 and 1"),
+    P(Type::Control, "a low cut (like 200hz)"),
+    P(Type::Control, "a high cut (like 4khz)"),
+];
+
+fn filter_with(c: &Call, kind: filter::Kind) -> Result<Value, Error> {
+    sound(Sound::Filter {
+        kind,
+        cutoff: c.cutoff(1)?,
+        resonance: c.control_or(2, 0.0),
+        child: Box::new(c.sound(0)),
+    })
+}
+
+fn echo_with(c: &Call, pingpong: bool) -> Result<Value, Error> {
+    let time = c.duration(1);
+    if time <= 0.0 {
+        return Err(c.wrong(1, "a delay time above 0"));
+    }
+    let low = if c.args.len() > 4 {
+        c.cutoff(4)?
+    } else {
+        Control::Constant(hz_to_note(ECHO_LOW_HZ))
+    };
+    let high = if c.args.len() > 5 {
+        c.cutoff(5)?
+    } else {
+        Control::Constant(hz_to_note(ECHO_HIGH_HZ))
+    };
+    sound(Sound::Echo {
+        child: Box::new(c.sound(0)),
+        time,
+        feedback: c.control_or(2, ECHO_FEEDBACK),
+        mix: c.control_or(3, ECHO_MIX),
+        low,
+        high,
+        pingpong,
+    })
 }
 
 /// The values `with` fills holes with, checked against the holes there are.
@@ -1145,6 +1678,8 @@ pub struct Evaluator {
     /// Values named with `let`. They live as long as the evaluator, so a block
     /// can use what an earlier one defined.
     vars: HashMap<String, Value>,
+    /// The buses `duck` listens to, by slot name.
+    buses: HashMap<String, Arc<Bus>>,
 }
 
 impl Evaluator {
@@ -1157,7 +1692,18 @@ impl Evaluator {
             wavetables: HashMap::new(),
             bpm: Clock::DEFAULT_BPM,
             vars: HashMap::new(),
+            buses: HashMap::new(),
         }
+    }
+
+    /// The buses `duck` listens to, by slot name: the session has the engine
+    /// fill them from those slots' voices.
+    pub fn buses(&self) -> impl Iterator<Item = (&String, &Arc<Bus>)> {
+        self.buses.iter()
+    }
+
+    fn bus(&mut self, slot: &str) -> Arc<Bus> {
+        self.buses.entry(slot.to_string()).or_default().clone()
     }
 
     pub fn bundle(&self) -> &Bundle {
@@ -1800,8 +2346,19 @@ mod tests {
             sample("b.wav").play
             notes("c2", 1b).play(lead)
             sample("c.wav").play("pad")
+            sample("d.wav").play(at 4b, "later")
+            notes("x", 1b).play(hat, "fives", at 5b + 2)
         "#;
-        assert_eq!(named_slots(&parse(src).unwrap()), ["hat", "pad"]);
+        let grid = |every, offset| Some(Grid { every, offset });
+        assert_eq!(
+            named_slots(&parse(src).unwrap()),
+            [
+                ("hat".to_string(), None),
+                ("pad".to_string(), None),
+                ("later".to_string(), grid(4.0, 0.0)),
+                ("fives".to_string(), grid(5.0, 2.0)),
+            ]
+        );
     }
 
     #[test]
@@ -1861,7 +2418,9 @@ mod tests {
             r#"let lead = wavetable("basic", 0, 0, ?note) * envelope("slow")"#,
         );
         // Released at the gate (0.5 s), then a second of release.
-        let voice = ev.vars["lead"].sound().for_note(Some(69.0), 0.5, 0.0);
+        let voice = ev.vars["lead"]
+            .sound()
+            .for_note(Some(Control::Constant(69.0)), Some(0.5), 0.0);
         let frames = render_node(voice.instantiate(48_000).as_mut(), 48_000 * 10);
         assert_eq!(frames.len(), 72_000);
 
@@ -1872,7 +2431,7 @@ mod tests {
                 &mut ev,
                 &format!(r#"let s = sample("ones.wav").repeat(inf) * modulation("ramp"){clock}"#),
             );
-            let voice = ev.vars["s"].sound().for_note(None, 0.25, 0.5);
+            let voice = ev.vars["s"].sound().for_note(None, Some(0.25), 0.5);
             let frames = render_node(voice.instantiate(48_000).as_mut(), 48_000 * 10);
             assert_eq!(frames.len(), 12_000);
             (frames[0][0], frames[6_000][0])
@@ -1886,7 +2445,7 @@ mod tests {
         close(ramp(".latch"), (0.5, 0.5));
         assert_eq!(
             error_with(&mut ev, "0.5.latch"),
-            "latch: expected a modulation, got a number"
+            "latch: expected a modulation or a random, got a number"
         );
     }
 
@@ -1905,5 +2464,210 @@ mod tests {
             error_with(&mut ev, r#"play(modulation("ramp"))"#),
             "play: expected a sound, got a control"
         );
+    }
+
+    /// The one play action `src` produces: its slot and grid.
+    fn play_timing(src: &str) -> (Option<String>, Option<Grid>) {
+        match evaluator().run(&parse(src).unwrap()).unwrap().pop() {
+            Some(Action::Play { slot, at, .. } | Action::Pattern { slot, at, .. }) => (slot, at),
+            _ => panic!("nothing played"),
+        }
+    }
+
+    #[test]
+    fn plays_take_a_slot_and_a_grid() {
+        let kick = r#"sample("kick.mp3")"#;
+        let grid = |every, offset| Some(Grid { every, offset });
+        assert_eq!(play_timing(&format!("{kick}.play")), (None, None));
+        assert_eq!(play_timing(&format!("{kick}.play()")), (None, None));
+        assert_eq!(
+            play_timing(&format!(r#"{kick}.play("a")"#)),
+            (Some("a".into()), None)
+        );
+        assert_eq!(
+            play_timing(&format!("{kick}.play(at 4b)")),
+            (None, grid(4.0, 0.0))
+        );
+        assert_eq!(
+            play_timing(&format!(r#"{kick}.play("a", at 5b + 2)"#)),
+            (Some("a".into()), grid(5.0, 2.0))
+        );
+        assert_eq!(
+            play_timing(&format!(
+                r#"notes("x", 1b).play({kick}, "d", at 1bar + 0.5b)"#
+            )),
+            (Some("d".into()), grid(4.0, 0.5))
+        );
+        assert_eq!(
+            play_timing(&format!(r#"notes("x", 1b).play({kick}, at 2b)"#)),
+            (None, grid(2.0, 0.0))
+        );
+        assert_eq!(
+            error(&format!("{kick}.play(at 0b)")),
+            "at: expected a grid size above 0 beats, got a length in beats"
+        );
+        assert_eq!(
+            error(&format!("{kick}.play(at 4)")),
+            "at: expected a grid size in beats (like 4b), got a number"
+        );
+        assert_eq!(
+            error(&format!("{kick}.play(4)")),
+            "play: expected a slot name (like \"drums\") or a start grid (like at 4b), got a number"
+        );
+    }
+
+    fn rms(frames: &[Frame]) -> f32 {
+        (frames.iter().map(|f| f[0] * f[0]).sum::<f32>() / frames.len() as f32).sqrt()
+    }
+
+    /// How bright a sound is: neighbouring samples' differences against the
+    /// level.
+    fn brightness(frames: &[Frame]) -> f32 {
+        let diff: f32 = frames.windows(2).map(|w| (w[1][0] - w[0][0]).abs()).sum();
+        diff / frames.iter().map(|f| f[0].abs()).sum::<f32>()
+    }
+
+    #[test]
+    fn noise_and_filters() {
+        let white = render(r#"noise().fit(1s).play"#);
+        assert_eq!(white.len(), 48_000);
+        assert!(rms(&white) > 0.1);
+        let brown = render(r#"noise("brown").fit(1s).play"#);
+        assert!(brightness(&brown) < brightness(&white) * 0.2);
+        let low = render(r#"noise().lowpass(500hz).fit(1s).play"#);
+        let high = render(r#"noise().highpass(5khz, 0.3).fit(1s).play"#);
+        let band = render(r#"noise().bandpass(c6, 0.9).fit(1s).play"#);
+        assert!(brightness(&low) < brightness(&white) * 0.3);
+        assert!(brightness(&high) > brightness(&white));
+        assert!(rms(&band) < rms(&white) * 0.3);
+        // The cutoff can move: a lowpass opening up gets brighter.
+        let mut ev = with_resources();
+        let sweep = render_with(
+            &mut ev,
+            r#"noise().lowpass(30 + modulation("ramp") * 100).play"#,
+        );
+        let sweep = &sweep[..48_000];
+        assert!(brightness(&sweep[40_000..]) > 3.0 * brightness(&sweep[..8_000]));
+        assert!(
+            error(r#"noise("green")"#)
+                .starts_with("noise: unknown color \"green\" (try white, pink,")
+        );
+        assert_eq!(
+            error(r#"noise().lowpass(800)"#),
+            "lowpass: a cutoff is a pitch: 800 would be note 800 (did you mean 800hz?)"
+        );
+    }
+
+    #[test]
+    fn pan_spread_and_echo() {
+        let side = |frames: &[Frame]| frames.iter().map(|f| (f[0] - f[1]).abs()).sum::<f32>();
+        let tone = r#"wavetable("basic", 0, 0, a4).fit(500ms)"#;
+        let left = render(&format!("{tone}.pan(-1).play"));
+        assert!(left.iter().all(|f| f[1].abs() < 1e-6));
+        assert_eq!(side(&render(&format!("{tone}.play"))), 0.0);
+        assert!(side(&render(&format!("{tone}.spread.play"))) > 100.0);
+        assert!(
+            side(&render(&format!("{tone}.spread(0.2).play")))
+                < side(&render(&format!("{tone}.spread(1).play")))
+        );
+        // Echoes: a 10 ms click every 250 ms (half a beat), dying away.
+        let echoes = render(r#"sample("kick.mp3").fit(10ms).echo(0.5b, 0.5, 0.5).play"#);
+        let peak = |at: usize| {
+            echoes[at..at + 480]
+                .iter()
+                .fold(0f32, |m, f| m.max(f[0].abs()))
+        };
+        assert!(peak(12_000) > 0.05 && peak(24_000) > 0.02 && peak(24_000) < peak(12_000));
+        assert!(peak(6_000) < 1e-3, "nothing in between");
+        let pingpong = render(r#"sample("kick.mp3").fit(10ms).pingpong(100ms, 0.5, 1).play"#);
+        assert!(pingpong[4_800..5_280].iter().all(|f| f[1].abs() < 1e-6));
+        assert!(pingpong[9_600..10_080].iter().any(|f| f[1].abs() > 1e-3));
+        assert_eq!(
+            error(r#"sample("kick.mp3").echo(0ms)"#),
+            "echo: expected a delay time above 0, got a duration"
+        );
+    }
+
+    #[test]
+    fn random_range_and_round() {
+        let mut ev = evaluator();
+        // A new note every 100 ms, a whole semitone from a3 to c4.
+        let notes: Vec<f32> = {
+            run(&mut ev, "let r = random(100ms).range(a3, c4)");
+            let Value::Control(c) = &ev.vars["r"] else {
+                panic!()
+            };
+            let mut node = c.instantiate(48_000);
+            let mut buf = vec![0.0; 48_000];
+            node.process(&mut buf);
+            buf.iter().step_by(4_800).copied().collect()
+        };
+        assert!(
+            notes.iter().all(|n| [57.0, 58.0, 59.0, 60.0].contains(n)),
+            "{notes:?}"
+        );
+        assert!(notes.windows(2).any(|w| w[0] != w[1]));
+        let values = |src: &str| {
+            let mut ev = evaluator();
+            run(&mut ev, &format!("let r = {src}"));
+            let Value::Control(c) = &ev.vars["r"] else {
+                panic!()
+            };
+            let mut buf = vec![0.0; 48_000];
+            c.instantiate(48_000).process(&mut buf);
+            buf
+        };
+        let continuous = values("random(10ms).range(-1, 1)");
+        assert!(continuous.iter().all(|v| (-1.0..=1.0).contains(v)));
+        assert!(continuous.iter().any(|v| v.fract() != 0.0));
+        let rounded = values("random(10ms).range(0, 12).round");
+        assert!(
+            rounded
+                .iter()
+                .all(|v| v.fract() == 0.0 && (0.0..=12.0).contains(v))
+        );
+        // In a pattern, each note picks up the stream where it is; latched,
+        // it holds that value for the whole note.
+        let mut ev = with_resources();
+        run(&mut ev, &format!("let s = {ONES}.gain(random(1ms).latch)"));
+        let voice = |since| {
+            let voice = ev.vars["s"].sound().for_note(None, Some(0.1), since);
+            render_node(voice.instantiate(48_000).as_mut(), 48_000)
+        };
+        let a = voice(0.5);
+        assert!(a.iter().all(|f| f[0] == a[0][0]), "held");
+        assert_eq!(voice(0.5)[0], a[0], "the stream's value at 0.5 s");
+        assert_ne!(voice(0.7)[0], a[0], "another note, another value");
+        assert_eq!(
+            error("random(0ms)"),
+            "random: expected a period above 0, got a duration"
+        );
+    }
+
+    #[test]
+    fn patterns_glide() {
+        let mut ev = evaluator();
+        let actions = ev
+            .run(
+                &parse(
+                    r#"notes("c4 e4", 0.5b).glide(100ms).play(wavetable("basic", 0, 0, ?note))"#,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let [Action::Pattern { pattern, .. }] = actions.as_slice() else {
+            panic!()
+        };
+        assert_eq!(pattern.glide, Some(0.1));
+        let glide_in_beats = ev
+            .run(
+                &parse(r#"notes("c4 e4", 0.5b).glide(0.5b).play(wavetable("basic", 0, 0, ?note))"#)
+                    .unwrap(),
+            )
+            .unwrap();
+        let [Action::Pattern { pattern, .. }] = glide_in_beats.as_slice() else {
+            panic!()
+        };
+        assert_eq!(pattern.glide, Some(0.25));
     }
 }

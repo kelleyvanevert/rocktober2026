@@ -13,9 +13,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::clock::Clock;
+use crate::clock::{Clock, Grid};
 use crate::engine::Slot;
-use crate::eval::Sound;
+use crate::eval::{Control, Sound};
 use crate::nodes::Node;
 use crate::pattern::{Pattern, Step};
 
@@ -61,10 +61,6 @@ impl Scheduler {
         }
     }
 
-    fn lookahead(&self) -> u64 {
-        (LOOKAHEAD_SECONDS * self.sample_rate as f64) as u64
-    }
-
     /// The engine slot for a slot name (0 for none).
     pub fn slot(&mut self, name: Option<&str>) -> Slot {
         let Some(name) = name else {
@@ -74,10 +70,11 @@ impl Scheduler {
         *self.slots.entry(name.to_string()).or_insert(next)
     }
 
-    /// The beat something started now starts on: the first bar line after
-    /// twice the lookahead, so it's clear of anything already sent.
-    pub fn start_beat(&self, now: u64) -> f64 {
-        self.clock.next_bar(now + 2 * self.lookahead())
+    /// The beat something starts on if it can start at frame `earliest`:
+    /// right then, or on the next point of its grid.
+    pub fn start_beat(&self, earliest: u64, at: Option<Grid>) -> f64 {
+        let beat = self.clock.beat_at(earliest);
+        at.map_or(beat, |grid| grid.next(beat))
     }
 
     pub fn add(&mut self, pattern: Arc<Pattern>, instrument: Sound, slot: Slot, start: f64) {
@@ -128,10 +125,28 @@ impl Scheduler {
                 if at >= horizon {
                     break;
                 }
-                if let Step::Hit { note, length } = steps[r.next % steps.len()] {
-                    let gate = clock.seconds(length as f64 * step);
-                    let since = clock.seconds(r.next as f64 * step);
-                    let voice = r.instrument.for_note(note, gate, since);
+                let since = clock.seconds(r.next as f64 * step);
+                let voice = match (r.pattern.glide, &steps[r.next % steps.len()]) {
+                    // Legato: one voice per phrase, its pitch gliding along.
+                    (Some(glide), _) => r.pattern.phrase(r.next).map(|length| {
+                        let path = Control::NotePath {
+                            pattern: r.pattern.clone(),
+                            start: r.next,
+                            step: clock.seconds(step),
+                            glide,
+                        };
+                        let note = r.pattern.has_notes().then_some(path);
+                        let gate = length.map(|n| clock.seconds(n as f64 * step));
+                        r.instrument.for_note(note, gate, since)
+                    }),
+                    (None, Step::Hit { note, length }) => {
+                        let gate = clock.seconds(*length as f64 * step);
+                        let note = note.map(Control::Constant);
+                        Some(r.instrument.for_note(note, Some(gate), since))
+                    }
+                    (None, _) => None,
+                };
+                if let Some(voice) = voice {
                     events.push(Event {
                         at,
                         node: voice.instantiate(self.sample_rate),
@@ -218,10 +233,40 @@ mod tests {
     }
 
     #[test]
-    fn plays_start_on_the_next_bar_after_the_lookahead() {
+    fn plays_start_right_away_or_on_their_grid() {
         let s = Scheduler::new(48_000);
-        assert_eq!(s.start_beat(0), 4.0);
-        // Just before bar 2 (beat 8 = frame 192000): too close, so bar 3.
-        assert_eq!(s.start_beat(190_000), 12.0);
+        // 120 bpm: a beat is 24000 frames.
+        assert_eq!(s.start_beat(36_000, None), 1.5);
+        assert_eq!(s.start_beat(36_000, Some(Grid::new(4.0))), 4.0);
+        assert_eq!(s.start_beat(0, Some(Grid::new(4.0))), 0.0);
+        let fives = Grid {
+            every: 5.0,
+            offset: 2.0,
+        };
+        assert_eq!(s.start_beat(24_000 * 3, Some(fives)), 7.0);
+    }
+
+    #[test]
+    fn gliding_patterns_play_a_voice_per_phrase() {
+        let (lead, mut s) = setup();
+        let mut legato = (*pattern("c4 e4 _ . g4 . c4 c4")).clone();
+        legato.glide = Some(0.05);
+        legato.times = 1;
+        s.add(Arc::new(legato), lead, 0, 0.0);
+        let mut events = s.due(1_000_000);
+        let at: Vec<u64> = events.iter().map(|e| e.at).collect();
+        assert_eq!(at, [0, 48_000, 72_000]);
+        // The first phrase lasts its three steps, gliding from c4 up to e4.
+        let mut buf = vec![[0.0; 2]; 100_000];
+        assert_eq!(events[0].node.process(&mut buf), 36_000);
+        let crossings = |from: usize, to: usize| {
+            buf[from..to]
+                .windows(2)
+                .filter(|w| w[0][0] < 0.0 && w[1][0] >= 0.0)
+                .count()
+        };
+        // c4 is 261.6 Hz, e4 329.6: a quarter second of each.
+        assert!((64..=67).contains(&crossings(0, 12_000)));
+        assert!((81..=84).contains(&crossings(18_000, 30_000)));
     }
 }
