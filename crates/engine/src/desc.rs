@@ -326,6 +326,7 @@ impl Node {
                 bus.clone(),
                 param("depth"),
                 self.seconds("release").unwrap_or(0.15) as f32,
+                self.num("threshold") as f32,
                 sample_rate,
             )),
             (Kind::Limit, _) => Box::new(Limit::new(

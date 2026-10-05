@@ -71,8 +71,6 @@ impl Bus {
     }
 }
 
-/// Above this (-40 dBFS), the key counts as sounding.
-const THRESHOLD: f32 = 0.01;
 /// How long the key's level is held through its zero crossings.
 const HOLD_SECONDS: f32 = 0.01;
 /// How fast the duck goes down.
@@ -80,6 +78,8 @@ const ATTACK_SECONDS: f32 = 0.002;
 
 /// Turns its child down while the key (a bus) sounds: by `amount` (0..1, 1 is
 /// all the way), quickly, then back up over `release` once the key is quiet.
+/// The key sounds while it's above `threshold`; a kick's tail can stay above
+/// a low one for longer than a beat, which keeps the duck down throughout.
 /// How loud the key is doesn't matter, only whether it sounds: a ghost note
 /// ducks as deep as an accent, which keeps it predictable, like a volume
 /// shaper triggered by the kick.
@@ -87,6 +87,7 @@ pub struct Duck {
     child: Box<dyn Node>,
     bus: Arc<Bus>,
     amount: Param,
+    threshold: f32,
     /// The absolute frame of the next output, once known.
     next: Option<u64>,
     peak: f32,
@@ -102,6 +103,7 @@ impl Duck {
         bus: Arc<Bus>,
         amount: Param,
         release: f32,
+        threshold: f32,
         sample_rate: u32,
     ) -> Self {
         let rate = sample_rate as f32;
@@ -111,6 +113,7 @@ impl Duck {
             child,
             bus,
             amount,
+            threshold,
             next: None,
             peak: 0.0,
             hold: 1.0 - coef(HOLD_SECONDS),
@@ -140,7 +143,7 @@ impl Node for Duck {
                 let at = (first - start) as usize + i;
                 let key = if at < len { self.bus.level(at) } else { 0.0 };
                 self.peak = key.max(self.peak * self.hold);
-                let (target, coef) = if self.peak > THRESHOLD {
+                let (target, coef) = if self.peak > self.threshold {
                     (1.0, self.attack)
                 } else {
                     (0.0, self.release)
@@ -193,7 +196,7 @@ mod tests {
     fn ducks_while_the_key_sounds_then_recovers() {
         let bus = Arc::new(Bus::default());
         // 1 kHz, so frames are milliseconds: release over 100 ms.
-        let mut duck = Duck::new(ones(10_000), bus.clone(), Param::Const(0.8), 0.1, 1000);
+        let mut duck = Duck::new(ones(10_000), bus.clone(), Param::Const(0.8), 0.1, 0.01, 1000);
         let mut out = vec![[0.0; 2]; 100];
         let mut gains = Vec::new();
         for block in 0..10u64 {
@@ -225,9 +228,23 @@ mod tests {
     }
 
     #[test]
+    fn a_key_below_the_threshold_doesnt_count() {
+        let bus = Arc::new(Bus::default());
+        let mut duck = Duck::new(ones(1000), bus.clone(), Param::Const(1.0), 0.1, 0.1, 1000);
+        bus.begin(0, 100);
+        // A loud hit, then a tail that's quieter than the threshold.
+        bus.add(0, &[[0.5, 0.5]; 10], |_| 1.0);
+        bus.add(10, &[[0.05, 0.05]; 90], |_| 1.0);
+        let mut out = vec![[0.0; 2]; 100];
+        duck.process(&mut out);
+        assert!(out[5][0] < 0.1, "down under the hit: {}", out[5][0]);
+        assert!(out[99][0] > 0.5, "coming back up during the tail: {}", out[99][0]);
+    }
+
+    #[test]
     fn a_voice_starting_mid_block_lines_up_with_the_end() {
         let bus = Arc::new(Bus::default());
-        let mut duck = Duck::new(ones(1000), bus.clone(), Param::Const(1.0), 0.1, 1000);
+        let mut duck = Duck::new(ones(1000), bus.clone(), Param::Const(1.0), 0.1, 0.01, 1000);
         bus.begin(0, 100);
         bus.add(60, &[[1.0, 1.0]; 40], |_| 1.0);
         // As a voice starting 50 frames in: asked for the last 50.

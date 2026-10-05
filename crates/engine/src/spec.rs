@@ -507,9 +507,18 @@ pub static SPECS: &[Spec] = &[
                 Def::Seconds(0.15),
                 "how long it takes to come back up",
             ),
+            p(
+                "threshold",
+                Ty::Num,
+                Def::Num(0.1),
+                "how loud the key has to be to count as sounding: a factor (or decibels, like -20db); higher lets go sooner",
+            ),
         ],
         presets: &[],
-        examples: &["pad * duck(\"kick\"):depth(0.9)"],
+        examples: &[
+            "pad * duck(\"kick\"):depth(0.9)",
+            "pad * duck(\"kick\"):threshold(-12db)",
+        ],
     },
     Spec {
         name: "limit",
