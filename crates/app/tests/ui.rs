@@ -65,7 +65,7 @@ mod macos {
                     let options = WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds {
                             origin: Default::default(),
-                            size: size(px(900.), px(560.)),
+                            size: size(px(1280.), px(800.)),
                         })),
                         show: false,
                         ..Default::default()
@@ -218,6 +218,15 @@ mod macos {
             Modulation::from_json(name, &entry.data).unwrap()
         }
 
+        /// The documentation panel's title and param names.
+        fn doc(&mut self) -> Option<(String, Vec<String>)> {
+            self.cx.update(|cx| {
+                let doc = self.workspace.read(cx).doc()?;
+                let params = doc.params.iter().map(|p| p.name.clone()).collect();
+                Some((doc.title.clone(), params))
+            })
+        }
+
         fn last_log(&mut self) -> String {
             self.cx.update(|cx| {
                 self.workspace
@@ -289,15 +298,46 @@ mod macos {
             h.last_log()
         );
 
-        // The cursor on a resource reference opens its editor below the code.
+        // The documentation follows the cursor: a built-in, a param, a let
+        // (with its free params), and it stays put on things it can't
+        // document.
         h.set_text(concat!(
-            "sample(\"kick.mp3\", 0:00:100).gain(-6db).play\n",
+            "let lead = saw * lowpass:freq(?note + 24)\n",
+            "lead:note(c3).play\n",
+            "-- a comment about sine\n",
+        ));
+        h.move_to(0, 13);
+        assert_eq!(
+            h.doc(),
+            Some(("saw".into(), vec!["warp".into(), "note".into()]))
+        );
+        h.move_to(0, 27);
+        assert_eq!(h.doc().unwrap().0, ":freq");
+        h.move_to(2, 20);
+        assert_eq!(h.doc().unwrap().0, ":freq");
+        // A let is documented once it's run.
+        h.move_to(1, 2);
+        assert_eq!(h.doc().unwrap().0, ":freq", "not run yet: unknown");
+        h.press_at(0, 0, "cmd-enter");
+        h.move_to(1, 2);
+        assert_eq!(
+            h.doc(),
+            Some((
+                "lead".into(),
+                vec!["note".into(), "res".into(), "warp".into()]
+            ))
+        );
+        h.snapshot("4b-docs");
+
+        // The cursor on a resource reference opens its editor in the panel.
+        h.set_text(concat!(
+            "(sample(\"kick.mp3\", 0:00:100) * -6db).play\n",
             "\n",
             "sample(\"nope.wav\").play\n",
             "\n",
             "envelope(\"pluck\")\n",
         ));
-        h.move_to(0, 3);
+        h.move_to(0, 4);
         assert_eq!(h.resource(), Some(("kick.mp3".into(), true)));
         h.snapshot("5-sample");
         h.move_to(2, 10);
@@ -330,7 +370,7 @@ mod macos {
         h.snapshot("6b-dropped-sample");
 
         // A missing envelope can be created, then edited by dragging.
-        h.set_text("envelope(\"pluck\")\n\nmodulation(\"sweep\")\n");
+        h.set_text("envelope(\"pluck\")\n\nmod(\"sweep\")\n");
         h.move_to(0, 3);
         h.snapshot("7-missing-envelope");
         h.with_window(|window, cx| window.click("create", cx));

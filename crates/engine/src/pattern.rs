@@ -8,10 +8,11 @@
 //! without a pitch, for drums), `.` or `~` (a rest), or `_` (the previous note
 //! holds on through this step too). A pattern loops.
 //!
-//! `pattern.glide(150ms)` makes it legato: notes that follow each other
-//! without a rest are one voice, sliding from note to note, and a rest ends
-//! the phrase, so the next note starts a new voice (with its envelope's
-//! attack). Like a mono synth with glide in legato mode.
+//! Played with a sound that glides `:legato` (`sound:note(glide(?note):legato)`),
+//! notes that follow each other without a rest are one voice, sliding from
+//! note to note, and a rest ends the phrase, so the next note starts a new
+//! voice (with its envelope's attack). Like a mono synth with glide in legato
+//! mode.
 
 use crate::lang;
 
@@ -34,8 +35,6 @@ pub struct Pattern {
     pub step: f64,
     /// How many times it plays (`usize::MAX`: forever).
     pub times: usize,
-    /// Glide time in seconds, for a legato pattern.
-    pub glide: Option<f64>,
 }
 
 impl Pattern {
@@ -86,7 +85,6 @@ impl Pattern {
             steps,
             step,
             times: usize::MAX,
-            glide: None,
         })
     }
 

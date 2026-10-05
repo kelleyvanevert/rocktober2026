@@ -1,22 +1,21 @@
-//! A tiny language: nested function calls over strings, numbers and durations.
+//! A tiny language of nodes, their params, and operators.
 //!
 //! ```text
-//! play(repeat(fit(sample("kick.mp3"), 500ms), 4))   -- comment
+//! let wub = wavetable:table("sine-saw"):note(?note + 12) * lowpass:freq(c6) * 0.5
+//! wub:note(g2).play("wub", at 4b)                          -- comment
 //! ```
 //!
-//! `x.f(a, b)` is shorthand for `f(x, a, b)`, and `x.f` for `f(x)`, so the two
-//! styles can be mixed freely:
-//!
-//! ```text
-//! sample("kick.mp3").fit(500ms).repeat(4).play
-//! ```
-//!
-//! `a * b` is shorthand for `mul(a, b)` and `a + b` for `add(a, b)`. Method
-//! calls bind tightest, then `*`, then `+`; parentheses group:
-//!
-//! ```text
-//! (sample("kick.mp3") * envelope("pluck").gate(100ms)).play
-//! ```
+//! - A bare name like `wavetable` is a node with all its params at their
+//!   defaults. `wavetable("sine-saw", 0.6)` fills its params in order.
+//! - `x:name(value)` sets every free param called `name` in `x` (`x:name`
+//!   alone is `x:name(1)`, for switches like `:retrig`).
+//! - `?name` is a new free param (`?name = 0.2` one with a default).
+//! - `x.f(a, b)` is shorthand for `f(x, a, b)`, and `x.f` for `f(x)`. These
+//!   are for operations, not nodes: `.play`, `.fit(500ms)`, `.repeat(4)`, ...
+//! - `a + b`, `a - b`, `a * b`, `a / b` are `add`, `sub`, `mul` and `div`,
+//!   with the usual precedence; `-x` is `mul(-1, x)`. Method calls and
+//!   `:params` bind tightest.
+//! - `[a, b, c]` is a list, and `n => n * 2` a function of one parameter.
 //!
 //! Notes are written `c2`, `f#3`, `eb4` (`c4` is middle C, MIDI note 60; Ableton
 //! calls it C3). A frequency like `800hz` or `2khz` is just another way to write
@@ -27,11 +26,12 @@
 //! `let name = ...` names a value, and a bare `name` refers to it. `fn
 //! name(a, b) = ...` defines a function: one expression, with its parameters
 //! bound to the arguments of each call (so `x.name(b)` works too).
-//! `?name` is a hole to be filled in later, `?name = 0.2` one with a default,
-//! and `name: value` (only in arguments) fills one, as in `lead.with(pos: 0.2)`.
 //!
-//! The parser knows nothing about what `play` or `fit` mean; it just builds a tree.
-//! Giving the tree meaning is `eval`'s job.
+//! A name followed by `(` on the same line is a call; on the next line it's a
+//! name followed by a parenthesized expression (the next statement).
+//!
+//! The parser knows nothing about what `play` or `wavetable` mean; it just
+//! builds a tree. Giving the tree meaning is `eval`'s job.
 
 use std::fmt;
 
@@ -49,7 +49,7 @@ pub enum Expr {
     Beats(f64),
     /// A MIDI note number.
     Pitch(f64),
-    /// A name given with `let`.
+    /// A name given with `let`, or a node with its defaults (`wavetable`).
     Var(String),
     /// `let name = value`, only as a statement.
     Let {
@@ -67,10 +67,18 @@ pub enum Expr {
         name: String,
         default: Option<Box<Spanned>>,
     },
-    /// `name: value`, only as an argument.
-    Named {
+    /// `target:name(value)`. Its position is the name's.
+    Set {
+        target: Box<Spanned>,
         name: String,
         value: Box<Spanned>,
+    },
+    /// `[a, b, c]`.
+    List(Vec<Spanned>),
+    /// `param => body`.
+    Lambda {
+        param: String,
+        body: Box<Spanned>,
     },
 }
 
@@ -109,10 +117,14 @@ pub(crate) enum Token {
     Beats(f64),
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Comma,
     Dot,
     Star,
+    Slash,
     Plus,
+    Minus,
     Pitch(f64),
     Let,
     Fn,
@@ -120,6 +132,26 @@ pub(crate) enum Token {
     Question,
     Colon,
     Equals,
+    /// `=>`
+    Arrow,
+}
+
+impl Token {
+    /// Whether an expression can end with this token: then a `-` after it is
+    /// a minus, not the sign of a number (`9 - 1`, `9 -1`, `f(x) -1`).
+    fn ends_operand(&self) -> bool {
+        matches!(
+            self,
+            Token::Ident(_)
+                | Token::Str(_)
+                | Token::Num(_)
+                | Token::Duration(_)
+                | Token::Beats(_)
+                | Token::Pitch(_)
+                | Token::RParen
+                | Token::RBracket
+        )
+    }
 }
 
 /// The MIDI note number of a note name like `c4` (60), `f#3` or `eb4`.
@@ -147,19 +179,48 @@ pub fn note(text: &str) -> Option<f64> {
     Some((12 * (*octave as i32 - b'0' as i32 + 1) + semitone + accidental) as f64)
 }
 
+/// A note number written as a note name if it's a whole one (`c3`, `f#4`),
+/// or else as a number.
+pub fn note_name(note: f64) -> String {
+    const NAMES: [&str; 12] = [
+        "c", "c#", "d", "eb", "e", "f", "f#", "g", "ab", "a", "bb", "b",
+    ];
+    if note.fract() == 0.0 && (12.0..=131.0).contains(&note) {
+        let n = note as i32;
+        format!("{}{}", NAMES[(n % 12) as usize], n / 12 - 1)
+    } else {
+        format!("{note:.2}")
+    }
+}
+
 /// The (fractional) MIDI note number of a frequency.
 pub fn hz_to_note(hz: f64) -> f64 {
     69.0 + 12.0 * (hz / 440.0).log2()
 }
 
-/// Whether a '.' or '-' at `i` begins (or continues) a number rather than being
+/// A note number as a frequency, rounded for showing: `800hz`, `2.4khz`.
+pub fn note_to_hz_text(note: f64) -> String {
+    let hz = 440.0 * 2f64.powf((note - 69.0) / 12.0);
+    if hz >= 1000.0 {
+        format!("{}khz", (hz / 100.0).round() / 10.0)
+    } else {
+        format!("{}hz", hz.round())
+    }
+}
+
+/// Whether a '.' at `i` begins (or continues) a number rather than being
 /// punctuation.
-fn starts_number(bytes: &[u8], i: usize) -> bool {
-    matches!(bytes[i], b'.' | b'-')
+fn dot_starts_number(bytes: &[u8], i: usize) -> bool {
+    bytes[i] == b'.' && bytes.get(i + 1).is_some_and(|b| b.is_ascii_digit())
+}
+
+/// Whether a '-' at `i` is the sign of a number, given the token before it.
+fn minus_starts_number(bytes: &[u8], i: usize, previous: Option<&Token>) -> bool {
+    bytes[i] == b'-'
         && bytes
             .get(i + 1)
             .is_some_and(|b| b.is_ascii_digit() || *b == b'.')
-        && !(bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'-'))
+        && !previous.is_some_and(Token::ends_operand)
 }
 
 /// A time position: `m:ss` (seconds may have decimals) or `m:ss:mmm`, e.g.
@@ -176,11 +237,12 @@ fn parse_time(text: &str) -> Option<f64> {
 
 pub(crate) fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
     let bytes = src.as_bytes();
-    let mut tokens = Vec::new();
+    let mut tokens: Vec<(Token, usize)> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
         let start = i;
+        let previous = tokens.last().map(|(t, _)| t);
         match c {
             b' ' | b'\t' | b'\r' | b'\n' => i += 1,
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
@@ -188,15 +250,24 @@ pub(crate) fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                     i += 1;
                 }
             }
-            b'(' | b')' | b',' | b'.' | b'*' | b'+' | b'?' | b':' | b'='
-                if !starts_number(bytes, i) =>
+            b'=' if bytes.get(i + 1) == Some(&b'>') => {
+                tokens.push((Token::Arrow, start));
+                i += 2;
+            }
+            b'(' | b')' | b'[' | b']' | b',' | b'.' | b'*' | b'/' | b'+' | b'-' | b'?' | b':'
+            | b'='
+                if !dot_starts_number(bytes, i) && !minus_starts_number(bytes, i, previous) =>
             {
                 let tok = match c {
                     b'(' => Token::LParen,
                     b')' => Token::RParen,
+                    b'[' => Token::LBracket,
+                    b']' => Token::RBracket,
                     b',' => Token::Comma,
                     b'*' => Token::Star,
+                    b'/' => Token::Slash,
                     b'+' => Token::Plus,
+                    b'-' => Token::Minus,
                     b'?' => Token::Question,
                     b':' => Token::Colon,
                     b'=' => Token::Equals,
@@ -222,8 +293,7 @@ pub(crate) fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
                 }
                 // A '.' only continues a number if a digit follows, so `4.repeat`
                 // lexes as `4` `.` `repeat`.
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_digit() || (bytes[i] == b'.' && starts_number(bytes, i)))
+                while i < bytes.len() && (bytes[i].is_ascii_digit() || dot_starts_number(bytes, i))
                 {
                     i += 1;
                 }
@@ -304,19 +374,19 @@ pub(crate) fn lex(src: &str) -> Result<Vec<(Token, usize)>, Error> {
     Ok(tokens)
 }
 
-struct Parser {
+struct Parser<'a> {
+    src: &'a str,
     tokens: Vec<(Token, usize)>,
     i: usize,
-    end: usize,
 }
 
-impl Parser {
+impl Parser<'_> {
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.i).map(|(t, _)| t)
     }
 
     fn pos(&self) -> usize {
-        self.tokens.get(self.i).map_or(self.end, |(_, p)| *p)
+        self.tokens.get(self.i).map_or(self.src.len(), |(_, p)| *p)
     }
 
     fn expect(&mut self, tok: Token, what: &str) -> Result<(), Error> {
@@ -337,6 +407,12 @@ impl Parser {
         Ok(name)
     }
 
+    /// Whether the next token is a `(` on the same line as the source up to
+    /// `from`: that makes the name before it a call.
+    fn call_paren(&self, from: usize) -> bool {
+        self.peek() == Some(&Token::LParen) && !self.src[from..self.pos()].contains('\n')
+    }
+
     /// `let name = value`, `fn name(params) = body`, or an expression.
     fn statement(&mut self) -> Result<Spanned, Error> {
         if self.peek() == Some(&Token::Fn) {
@@ -347,10 +423,7 @@ impl Parser {
         }
         let pos = self.pos();
         self.i += 1;
-        let Some(Token::Ident(name)) = self.peek().cloned() else {
-            return err(self.pos(), "expected a name after 'let'");
-        };
-        self.i += 1;
+        let name = self.name("after 'let'")?;
         self.expect(Token::Equals, "'='")?;
         let value = Box::new(self.expr()?);
         Ok(Spanned {
@@ -391,25 +464,24 @@ impl Parser {
         })
     }
 
-    /// Terms joined by `+`, left to right.
+    /// Terms joined by `+` and `-`, left to right.
     fn expr(&mut self) -> Result<Spanned, Error> {
-        self.binary(Token::Plus, "add", Self::term)
+        self.binary(&[(Token::Plus, "add"), (Token::Minus, "sub")], Self::term)
     }
 
-    /// Method chains joined by `*`, left to right.
+    /// Factors joined by `*` and `/`, left to right.
     fn term(&mut self) -> Result<Spanned, Error> {
-        self.binary(Token::Star, "mul", Self::chain)
+        self.binary(&[(Token::Star, "mul"), (Token::Slash, "div")], Self::unary)
     }
 
-    /// `operand (op operand)*`, as nested calls of `function`.
+    /// `operand (op operand)*`, as nested calls of the ops' functions.
     fn binary(
         &mut self,
-        op: Token,
-        function: &str,
+        ops: &[(Token, &str)],
         operand: fn(&mut Self) -> Result<Spanned, Error>,
     ) -> Result<Spanned, Error> {
         let mut expr = operand(self)?;
-        while self.peek() == Some(&op) {
+        while let Some((_, function)) = ops.iter().find(|(op, _)| self.peek() == Some(op)) {
             let pos = self.pos();
             self.i += 1;
             let rhs = operand(self)?;
@@ -424,26 +496,79 @@ impl Parser {
         Ok(expr)
     }
 
-    /// A primary expression followed by any number of `.method` calls.
+    /// `-x`, as `mul(-1, x)`, or a chain.
+    fn unary(&mut self) -> Result<Spanned, Error> {
+        if self.peek() != Some(&Token::Minus) {
+            return self.chain();
+        }
+        let pos = self.pos();
+        self.i += 1;
+        let operand = self.unary()?;
+        Ok(Spanned {
+            expr: Expr::Call {
+                name: "mul".to_string(),
+                args: vec![
+                    Spanned {
+                        expr: Expr::Num(-1.0),
+                        pos,
+                    },
+                    operand,
+                ],
+            },
+            pos,
+        })
+    }
+
+    /// A primary expression followed by any number of `.method` calls and
+    /// `:param` settings.
     fn chain(&mut self) -> Result<Spanned, Error> {
         let mut expr = self.primary()?;
-        while self.peek() == Some(&Token::Dot) {
-            self.i += 1;
-            let pos = self.pos();
-            let Some(Token::Ident(name)) = self.peek().cloned() else {
-                return err(pos, "expected a name after '.'");
-            };
-            self.i += 1;
-            let mut args = vec![expr];
-            if self.peek() == Some(&Token::LParen) {
-                args.extend(self.args()?);
+        loop {
+            match self.peek() {
+                Some(Token::Dot) => {
+                    self.i += 1;
+                    let pos = self.pos();
+                    let name = self.name("after '.'")?;
+                    let mut args = vec![expr];
+                    if self.call_paren(pos) {
+                        args.extend(self.args()?);
+                    }
+                    expr = Spanned {
+                        expr: Expr::Call { name, args },
+                        pos,
+                    };
+                }
+                Some(Token::Colon) => {
+                    self.i += 1;
+                    let pos = self.pos();
+                    let name = self.name("after ':' (a param, like :note(c3))")?;
+                    let value = if self.call_paren(pos) {
+                        self.i += 1;
+                        let value = self.expr()?;
+                        if self.peek() == Some(&Token::Comma) {
+                            return err(self.pos(), format!(":{name} takes one value"));
+                        }
+                        self.expect(Token::RParen, "')'")?;
+                        value
+                    } else {
+                        // `:retrig` is `:retrig(1)`.
+                        Spanned {
+                            expr: Expr::Num(1.0),
+                            pos,
+                        }
+                    };
+                    expr = Spanned {
+                        expr: Expr::Set {
+                            target: Box::new(expr),
+                            name,
+                            value: Box::new(value),
+                        },
+                        pos,
+                    };
+                }
+                _ => return Ok(expr),
             }
-            expr = Spanned {
-                expr: Expr::Call { name, args },
-                pos,
-            };
         }
-        Ok(expr)
     }
 
     fn primary(&mut self) -> Result<Spanned, Error> {
@@ -459,10 +584,7 @@ impl Parser {
             Token::Beats(b) => Expr::Beats(b),
             Token::Pitch(note) => Expr::Pitch(note),
             Token::Question => {
-                let Some(Token::Ident(name)) = self.peek().cloned() else {
-                    return err(self.pos(), "expected a name after '?'");
-                };
-                self.i += 1;
+                let name = self.name("after '?'")?;
                 let default = if self.peek() == Some(&Token::Equals) {
                     self.i += 1;
                     Some(Box::new(self.expr()?))
@@ -472,7 +594,7 @@ impl Parser {
                 Expr::Hole { name, default }
             }
             // `at 4b`: a grid, as `at(4b)`. It takes a method chain, so it binds
-            // tighter than `*` and `+`.
+            // tighter than the operators.
             Token::At => Expr::Call {
                 name: "at".to_string(),
                 args: vec![self.chain()?],
@@ -482,15 +604,18 @@ impl Parser {
                 self.expect(Token::RParen, "')'")?;
                 return Ok(inner);
             }
+            Token::LBracket => Expr::List(self.list(Token::RBracket, "']'")?),
             Token::Ident(name) => {
-                if self.peek() != Some(&Token::LParen) {
-                    return Ok(Spanned {
-                        expr: Expr::Var(name),
-                        pos,
-                    });
+                if self.peek() == Some(&Token::Arrow) {
+                    self.i += 1;
+                    let body = Box::new(self.expr()?);
+                    Expr::Lambda { param: name, body }
+                } else if self.call_paren(pos + name.len()) {
+                    let args = self.args()?;
+                    Expr::Call { name, args }
+                } else {
+                    Expr::Var(name)
                 }
-                let args = self.args()?;
-                Expr::Call { name, args }
             }
             _ => return err(pos, "expected an expression"),
         };
@@ -500,41 +625,32 @@ impl Parser {
     /// `( a, b, c )`, allowing a trailing comma.
     fn args(&mut self) -> Result<Vec<Spanned>, Error> {
         self.expect(Token::LParen, "'('")?;
-        let mut args = Vec::new();
-        while self.peek() != Some(&Token::RParen) {
-            let named = match (self.peek(), self.tokens.get(self.i + 1)) {
-                (Some(Token::Ident(name)), Some((Token::Colon, _))) => Some(name.clone()),
-                _ => None,
-            };
-            match named {
-                Some(name) => {
-                    let pos = self.pos();
-                    self.i += 2;
-                    let value = Box::new(self.expr()?);
-                    args.push(Spanned {
-                        expr: Expr::Named { name, value },
-                        pos,
-                    });
-                }
-                None => args.push(self.expr()?),
-            }
+        self.list(Token::RParen, "')'")
+    }
+
+    /// Expressions separated by commas up to `close` (the opening bracket
+    /// has been read), allowing a trailing comma.
+    fn list(&mut self, close: Token, what: &str) -> Result<Vec<Spanned>, Error> {
+        let mut items = Vec::new();
+        while self.peek() != Some(&close) {
+            items.push(self.expr()?);
             match self.peek() {
                 Some(Token::Comma) => self.i += 1,
-                Some(Token::RParen) => {}
-                _ => return err(self.pos(), "expected ',' or ')'"),
+                Some(t) if *t == close => {}
+                _ => return err(self.pos(), format!("expected ',' or {what}")),
             }
         }
         self.i += 1;
-        Ok(args)
+        Ok(items)
     }
 }
 
 /// Parse a sequence of top-level expressions (statements).
 pub fn parse(src: &str) -> Result<Vec<Spanned>, Error> {
     let mut parser = Parser {
+        src,
         tokens: lex(src)?,
         i: 0,
-        end: src.len(),
     };
     let mut program = Vec::new();
     while parser.peek().is_some() {
@@ -604,7 +720,16 @@ mod tests {
                     Some(d) => format!("?{name}={}", show(&d.expr)),
                     None => format!("?{name}"),
                 },
-                Expr::Named { name, value } => format!("{name}: {}", show(&value.expr)),
+                Expr::Set {
+                    target,
+                    name,
+                    value,
+                } => format!("{}:{name}({})", show(&target.expr), show(&value.expr)),
+                Expr::List(items) => {
+                    let items: Vec<String> = items.iter().map(|a| show(&a.expr)).collect();
+                    format!("[{}]", items.join(", "))
+                }
+                Expr::Lambda { param, body } => format!("({param} => {})", show(&body.expr)),
             }
         }
         let prog = parse(src).unwrap();
@@ -618,6 +743,7 @@ mod tests {
             desugar(r#"sample("k").fit(500ms).repeat(4).play"#),
             r#"play(repeat(fit(sample("k"), 0.5s), 4))"#
         );
+        assert_eq!(desugar("x.play()"), "play(x)");
         assert_eq!(desugar("4.repeat"), "repeat(4)");
         assert_eq!(desugar("x(.5).y(-.5)"), "y(x(0.5), -0.5)");
     }
@@ -670,6 +796,70 @@ mod tests {
     }
 
     #[test]
+    fn minus_and_divide() {
+        assert_eq!(desugar("x * 9 - 1"), "sub(mul(x, 9), 1)");
+        assert_eq!(desugar("x * 9 -1"), "sub(mul(x, 9), 1)");
+        assert_eq!(desugar("f(x) -1"), "sub(f(x), 1)");
+        assert_eq!(desugar("x - -1"), "sub(x, -1)");
+        assert_eq!(desugar("a - b - c"), "sub(sub(a, b), c)");
+        assert_eq!(desugar("0 / n * 2"), "mul(div(0, n), 2)");
+        assert_eq!(desugar("-x * 2"), "mul(mul(-1, x), 2)");
+        assert_eq!(desugar("f(-x)"), "f(mul(-1, x))");
+        assert_eq!(desugar("[1, -2]"), "[1, -2]");
+        assert_eq!(desugar("x -- comment"), "x");
+    }
+
+    #[test]
+    fn params_are_set_with_colons() {
+        assert_eq!(
+            desugar("wavetable:pos(0.3):note(g4)"),
+            "wavetable:pos(0.3):note(note67)"
+        );
+        assert_eq!(
+            desugar("(a + b:table(\"saw\")):note(?note + swoop)"),
+            "add(a, b:table(\"saw\")):note(add(?note, swoop))"
+        );
+        assert_eq!(
+            desugar("node * lowpass:freq(?note + 24)"),
+            "mul(node, lowpass:freq(add(?note, 24)))"
+        );
+        assert_eq!(
+            desugar("mod(\"swoop\"):retrig * 9 - 1"),
+            "sub(mul(mod(\"swoop\"):retrig(1), 9), 1)"
+        );
+        assert_eq!(
+            desugar("x:note(glide(?note):dur(300ms)).play()"),
+            "play(x:note(glide(?note):dur(0.3s)))"
+        );
+        assert_eq!(
+            parse("x:pos(1, 2)").unwrap_err().msg,
+            ":pos takes one value"
+        );
+        assert!(parse("x:(1)").is_err());
+        // Times still lex as times.
+        assert_eq!(desugar("f(0:01)"), "f(1s)");
+    }
+
+    #[test]
+    fn lists_and_lambdas() {
+        assert_eq!(
+            desugar("[0, 2, 3].map(n => w:note(?note + n * 110)):note(c3)"),
+            "map([0, 2, 3], (n => w:note(add(?note, mul(n, 110))))):note(note48)"
+        );
+        assert_eq!(desugar("[]"), "[]");
+        assert_eq!(desugar("[a,]"), "[a]");
+        assert!(parse("[a b]").is_err());
+    }
+
+    #[test]
+    fn calls_need_their_paren_on_the_same_line() {
+        let prog = parse("let a = b\n(c + d).play").unwrap();
+        assert_eq!(prog.len(), 2);
+        assert_eq!(desugar("f(\n  1,\n)"), "f(1)");
+        assert_eq!(desugar("x.f\n"), "f(x)");
+    }
+
+    #[test]
     fn beats() {
         assert_eq!(
             desugar("f(0.25b, 1bar, 2bars, 120.bpm)"),
@@ -685,19 +875,18 @@ mod tests {
         );
         // Not notes: other letters, longer names, two-digit octaves.
         assert_eq!(desugar("f(h2, c10, cc2, b)"), "f(h2, c10, cc2, b)");
+        assert_eq!(note_name(48.0), "c3");
+        assert_eq!(note_name(61.0), "c#4");
+        assert_eq!(note_name(61.5), "61.50");
     }
 
     #[test]
-    fn lets_vars_holes_and_named_arguments() {
+    fn lets_vars_and_holes() {
         assert_eq!(
             desugar(
                 "let lead = wavetable(\"basic\", ?pos = 0.2, ?warp, ?note) * envelope(\"pluck\")"
             ),
             "let lead = mul(wavetable(\"basic\", ?pos=0.2, ?warp, ?note), envelope(\"pluck\"))"
-        );
-        assert_eq!(
-            desugar("lead.with(pos: 0.5, note: c2).play"),
-            "play(with(lead, pos: 0.5, note: note36))"
         );
         assert_eq!(desugar("lead"), "lead");
         assert_eq!(
@@ -721,6 +910,8 @@ mod tests {
             parse("f(0hz)").unwrap_err().msg,
             "a frequency has to be above 0hz"
         );
+        assert_eq!(note_to_hz_text(69.0), "440hz");
+        assert_eq!(note_to_hz_text(hz_to_note(2400.0)), "2.4khz");
     }
 
     #[test]
@@ -737,8 +928,8 @@ mod tests {
     #[test]
     fn functions() {
         assert_eq!(
-            desugar("fn wide(x, amount) = x.spread(amount).pan(-1)"),
-            "fn wide(x, amount) = pan(spread(x, amount), -1)"
+            desugar("fn wide(x, amount) = x * spread:width(amount)"),
+            "fn wide(x, amount) = mul(x, spread:width(amount))"
         );
         assert_eq!(desugar("fn f(\n  x,\n) = x"), "fn f(x) = x");
         assert_eq!(desugar("fn f() = g()"), "fn f() = g()");

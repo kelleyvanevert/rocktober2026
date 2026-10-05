@@ -530,6 +530,32 @@ impl Node for Multiply {
 pub struct Limit {
     child: Box<dyn Node>,
     child_done: bool,
+    limiter: Limiter,
+    tail: usize,
+    scratch: Vec<Frame>,
+}
+
+impl Limit {
+    /// `release_frames` is the time constant for the gain to recover.
+    pub fn new(child: Box<dyn Node>, ceiling: f32, lookahead: usize, release_frames: f32) -> Self {
+        let limiter = Limiter::new(ceiling, lookahead, release_frames);
+        Self {
+            child,
+            child_done: false,
+            tail: limiter.lookahead(),
+            limiter,
+            scratch: vec![[0.0; 2]; SCRATCH_FRAMES],
+        }
+    }
+
+    fn step(&mut self, input: Frame) -> Frame {
+        self.limiter.step(input)
+    }
+}
+
+/// The limiter behind `Limit` (see there), on its own: frames in, frames out,
+/// `lookahead` frames later. The engine runs one on the whole mix.
+pub struct Limiter {
     ceiling: f32,
     lookahead: usize,
     release: f32,
@@ -539,18 +565,14 @@ pub struct Limit {
     averaged: VecDeque<f32>,
     sum: f64,
     released: f32,
-    tail: usize,
     t: u64,
-    scratch: Vec<Frame>,
 }
 
-impl Limit {
+impl Limiter {
     /// `release_frames` is the time constant for the gain to recover.
-    pub fn new(child: Box<dyn Node>, ceiling: f32, lookahead: usize, release_frames: f32) -> Self {
+    pub fn new(ceiling: f32, lookahead: usize, release_frames: f32) -> Self {
         let lookahead = lookahead.max(1);
-        let mut limit = Self {
-            child,
-            child_done: false,
+        let mut limiter = Self {
             ceiling,
             lookahead,
             release: 1.0 - (-1.0 / release_frames.max(1.0)).exp(),
@@ -559,18 +581,20 @@ impl Limit {
             averaged: VecDeque::with_capacity(lookahead + 1),
             sum: 0.0,
             released: 1.0,
-            tail: 0,
             t: 0,
-            scratch: vec![[0.0; 2]; SCRATCH_FRAMES],
         };
-        limit.reset_state();
-        limit
+        limiter.reset();
+        limiter
+    }
+
+    /// How many frames late the output is.
+    pub fn lookahead(&self) -> usize {
+        self.lookahead
     }
 
     /// Prime the delay line with silence and every filter with unity gain.
     /// (Only touches preallocated capacity, so it's fine on the audio thread.)
-    fn reset_state(&mut self) {
-        self.child_done = false;
+    pub fn reset(&mut self) {
         self.delay.clear();
         self.delay
             .extend(std::iter::repeat_n([0.0; 2], self.lookahead));
@@ -580,11 +604,10 @@ impl Limit {
             .extend(std::iter::repeat_n(1.0, self.lookahead));
         self.sum = self.lookahead as f64;
         self.released = 1.0;
-        self.tail = self.lookahead;
         self.t = 0;
     }
 
-    fn step(&mut self, input: Frame) -> Frame {
+    pub fn step(&mut self, input: Frame) -> Frame {
         let peak = input[0].abs().max(input[1].abs());
         let needed = if peak > self.ceiling {
             self.ceiling / peak
@@ -653,7 +676,9 @@ impl Node for Limit {
 
     fn reset(&mut self) {
         self.child.reset();
-        self.reset_state();
+        self.child_done = false;
+        self.tail = self.limiter.lookahead();
+        self.limiter.reset();
     }
 }
 

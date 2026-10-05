@@ -1,8 +1,9 @@
-//! The main window: code editor, console, status bar.
+//! The main window: the code editor on the left; documentation, the
+//! resource editor and the log on the right; a status bar below.
 
 use std::ops::Range;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{
     Editor, EditorState, InputEvent, RangeDecoration, RangeDecorationCollection,
@@ -14,7 +15,9 @@ use gpui_kit::*;
 use rocktober_engine::Session;
 use rocktober_engine::bundle::{self, Bundle};
 use rocktober_engine::resource::{self, ResourceKind, ResourceRef};
+use rocktober_engine::spec::Doc;
 
+use crate::docs::{self, Lookup};
 use crate::envelope_editor::EnvelopeEditor;
 use crate::modulation_editor::ModulationEditor;
 use crate::sample_editor::{OverviewCache, SampleEditor};
@@ -24,7 +27,13 @@ use crate::{
 };
 
 const FLASH_DURATION: Duration = Duration::from_millis(250);
+/// How long the clipping warning stays up after the mix last went over.
+const CLIP_WARNING: Duration = Duration::from_millis(1500);
 const MAX_LOG_ENTRIES: usize = 500;
+/// The right-hand column's share of the window's width.
+const SIDE_WIDTH: f32 = 0.45;
+const RESOURCE_HEIGHT: f32 = 220.;
+const LOG_HEIGHT: f32 = 200.;
 
 const EXAMPLE: &str = r#"-- cmd-enter       run the selection, or the block under the cursor
 -- cmd-shift-enter run everything
@@ -44,10 +53,10 @@ seq(
   sample("kick.mp3").fit(125ms).repeat(2),
 ).repeat(2).play
 
-add(
-  sample("kick.mp3").gain(-6db),
+(add(
+  sample("kick.mp3") * -6db,
   sample("kick.mp3").fit(125ms).repeat(8),
-).limit.play
+) * limit).play
 
 -- play starts right away, play(at 1bar) on the next bar (at 4b, at 5b + 2,
 -- ...: any grid of beats); a named slot replaces what played there
@@ -55,11 +64,13 @@ add(
 
 notes("x . x . x x . .", 0.25b).play(sample("kick.mp3"), "drums", at 1bar)
 
-let lead = wavetable("basic", ?pos = 0.3, 0.2, ?note) * 0.5
-notes("c3 e3 g3 _ b3 . g3 e3", 0.25b).play(lead.duck("drums"), "lead", at 1bar)
+-- a node's params are free until they're set (put the cursor on a name to
+-- see them on the right); a pattern sets the note
+let lead = wavetable:pos(0.3):warp(0.2) * duck("drums") * 0.5
+notes("c3 e3 g3 _ b3 . g3 e3", 0.25b).play(lead, "lead", at 1bar)
 
--- noise, filters (cutoffs are pitches: 800hz, c6, ?note + 24), space
-noise("pink").bandpass(2khz, 0.6).fit(1b).echo(0.75b, 0.6).spread.pan(-0.5).play
+-- effects are applied by multiplying; cutoffs are pitches: 800hz, c6, ?note + 24
+((noise("pink") * bandpass(2khz, 0.6)).fit(1b) * echo(0.75b, 0.6) * spread * pan(-0.5)).play
 "#;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -105,10 +116,22 @@ pub struct Workspace {
     framed: Option<Range<usize>>,
     resource: Option<OpenResource>,
     overviews: OverviewCache,
+    /// What the documentation panel shows: the last name under the cursor
+    /// that had documentation (it stays while the cursor is elsewhere).
+    doc: Option<Doc>,
+    /// The name it was last looked up for, so it's only looked up again
+    /// when that changes (or code runs, which can change what a name is).
+    doc_lookup: Option<Lookup>,
     /// Bumped on every flash, so an old flash's timer doesn't clear a newer one.
     flash_generation: u64,
     session: Option<Session>,
     voices: usize,
+    /// The session's count of frames that went over full scale, as last
+    /// seen, and when it last went up: the mix is shown as clipping for a
+    /// while after that.
+    clipped: u64,
+    clipped_at: Option<Instant>,
+    clipping: bool,
     /// Whole seconds recorded, as last shown (so the timer redraws once a second).
     recorded_secs: Option<u64>,
     /// Tempo and position, as last shown: "120 bpm  3.2" (bar 3, beat 2).
@@ -230,6 +253,18 @@ impl Workspace {
                         this.recorded_secs = recorded;
                         cx.notify();
                     }
+                    let clipped = this.session.as_ref().map_or(0, |s| s.clipped());
+                    if clipped > this.clipped {
+                        this.clipped = clipped;
+                        this.clipped_at = Some(Instant::now());
+                    }
+                    let clipping = this
+                        .clipped_at
+                        .is_some_and(|at| at.elapsed() < CLIP_WARNING);
+                    if clipping != this.clipping {
+                        this.clipping = clipping;
+                        cx.notify();
+                    }
                 });
                 if alive.is_err() {
                     break;
@@ -250,10 +285,15 @@ impl Workspace {
             framed: None,
             resource: None,
             overviews: OverviewCache::default(),
+            doc: None,
+            doc_lookup: None,
             flash_generation: 0,
             session,
             voices: 0,
             recorded_secs: None,
+            clipped: 0,
+            clipped_at: None,
+            clipping: false,
             clock: String::new(),
             log,
             log_scroll: ScrollHandle::new(),
@@ -275,6 +315,16 @@ impl Workspace {
             state.set_value(text.to_string(), window, cx)
         });
         self.highlight_comments(cx);
+    }
+
+    /// Whether the status bar warns that the mix is going over full scale.
+    pub fn is_clipping(&self) -> bool {
+        self.clipping
+    }
+
+    /// What the documentation panel shows.
+    pub fn doc(&self) -> Option<&Doc> {
+        self.doc.as_ref()
     }
 
     /// The resource reference under the cursor, if any.
@@ -451,6 +501,9 @@ impl Workspace {
             }
             Err(e) => self.report_error(range.start + e.pos, &e.msg, cx),
         }
+        // What the code defined may have changed what a name is.
+        self.doc_lookup = None;
+        self.update_doc(cx);
     }
 
     /// Show an error at byte offset `at`: squiggle and console line.
@@ -488,9 +541,33 @@ impl Workspace {
         .detach();
     }
 
+    /// Follow the cursor: document the name it's on. A name without
+    /// documentation (or no name) leaves the last one shown.
+    fn update_doc(&mut self, cx: &mut Context<Self>) {
+        let state = self.editor.read(cx);
+        let lookup = docs::lookup_at(state.value().as_ref(), state.cursor());
+        if lookup.is_none() || lookup == self.doc_lookup {
+            return;
+        }
+        let doc = match &lookup {
+            Some(Lookup::Param(name)) => Doc::of_param(name),
+            Some(Lookup::Name(name)) => match &self.session {
+                Some(session) => session.describe(name),
+                None => Doc::builtin(name),
+            },
+            None => None,
+        };
+        self.doc_lookup = lookup;
+        if doc.is_some() && doc != self.doc {
+            self.doc = doc;
+            cx.notify();
+        }
+    }
+
     /// Follow the cursor: frame the resource reference it's on, and show that
-    /// resource's editor (or hide the panel if it's on none).
+    /// resource's editor (or an empty panel if it's on none).
     fn update_resource(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_doc(cx);
         let state = self.editor.read(cx);
         let text = state.value().to_string();
         let cursor = state.cursor();
@@ -658,6 +735,15 @@ impl Workspace {
             .text_color(theme.muted_foreground)
             .child(format!("{file_name}{}", if self.dirty { " •" } else { "" }))
             .child(div().flex_1())
+            .when(self.clipping, |this| {
+                // Not clipped, in fact: the limiter caught it, but it's
+                // squashing the mix.
+                this.child(
+                    div()
+                        .text_color(theme.danger)
+                        .child("clipping: limited, turn it down"),
+                )
+            })
             .child(self.clock.clone())
             .child(
                 div()
@@ -683,50 +769,143 @@ impl Workspace {
             )
     }
 
-    fn render_resource(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
-        let open = self.resource.as_ref()?;
+    /// A panel in the right-hand column, with a heading.
+    fn panel(title: &'static str, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
-        let content = match &open.view {
-            ResourceView::Sample(editor) => editor.clone().into_any_element(),
-            ResourceView::Envelope(editor) => editor.clone().into_any_element(),
-            ResourceView::Modulation(editor) => editor.clone().into_any_element(),
-            ResourceView::Unsupported => {
-                let kind = open.reference.kind.function();
+        v_flex().border_t_1().border_color(theme.border).child(
+            div()
+                .flex_shrink_0()
+                .px_3()
+                .pt_2()
+                .pb_1()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(title),
+        )
+    }
+
+    fn render_doc(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let (muted, mono) = (theme.muted_foreground, theme.mono_font_family.clone());
+        let body = match &self.doc {
+            None => div()
+                .text_sm()
+                .text_color(muted)
+                .child(
+                    "Put the cursor on a name (wavetable, lowpass, notes, a let) or a \
+                     param (:note) to see what it is and what params it has.",
+                )
+                .into_any_element(),
+            Some(doc) => v_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_baseline()
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::BOLD)
+                                .child(doc.title.clone()),
+                        )
+                        .child(div().text_xs().text_color(muted).child(doc.kind.clone())),
+                )
+                .child(div().text_sm().child(doc.summary.clone()))
+                .when(!doc.params.is_empty(), |this| {
+                    this.child(
+                        v_flex()
+                            .gap_0p5()
+                            .text_sm()
+                            .child(div().text_xs().text_color(muted).child("Params"))
+                            .children(doc.params.iter().map(|p| {
+                                h_flex()
+                                    .gap_2()
+                                    .items_start()
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .font_family(mono.clone())
+                                            .child(p.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .font_family(mono.clone())
+                                            .text_color(muted)
+                                            .child(p.default.clone()),
+                                    )
+                                    .child(div().text_color(muted).child(p.doc.clone()))
+                            })),
+                    )
+                })
+                .when(!doc.examples.is_empty(), |this| {
+                    this.child(
+                        v_flex()
+                            .gap_0p5()
+                            .child(div().text_xs().text_color(muted).child("Examples"))
+                            .children(doc.examples.iter().map(|e| {
+                                div().font_family(mono.clone()).text_sm().child(e.clone())
+                            })),
+                    )
+                })
+                .into_any_element(),
+        };
+        Self::panel("DOCUMENTATION", cx).flex_1().min_h_0().child(
+            div()
+                .id("doc")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px_3()
+                .pb_2()
+                .child(body),
+        )
+    }
+
+    fn render_resource(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let content = match self
+            .resource
+            .as_ref()
+            .map(|open| (&open.view, &open.reference))
+        {
+            Some((ResourceView::Sample(editor), _)) => editor.clone().into_any_element(),
+            Some((ResourceView::Envelope(editor), _)) => editor.clone().into_any_element(),
+            Some((ResourceView::Modulation(editor), _)) => editor.clone().into_any_element(),
+            Some((ResourceView::Unsupported, reference)) => {
+                let kind = reference.kind.function();
                 div()
                     .text_sm()
-                    .text_color(theme.muted_foreground)
+                    .text_color(muted)
                     .child(format!(
                         "{kind} \"{}\": there's no {kind} editor yet",
-                        open.reference.name
+                        reference.name
                     ))
                     .into_any_element()
             }
+            None => div()
+                .text_sm()
+                .text_color(muted)
+                .child("Put the cursor on a sample, envelope or mod to edit it here.")
+                .into_any_element(),
         };
-        Some(
-            div()
-                .h(px(200.))
-                .flex_shrink_0()
-                .px_3()
-                .py_2()
-                .border_t_1()
-                .border_color(theme.border)
-                .child(content),
-        )
+        Self::panel("EDITOR", cx)
+            .h(px(RESOURCE_HEIGHT))
+            .flex_shrink_0()
+            .child(div().flex_1().min_h_0().px_3().pb_2().child(content))
     }
 
     fn render_log(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        div()
+        let entries = div()
             .id("log")
-            .h(px(150.))
-            .flex_shrink_0()
+            .flex_1()
+            .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.log_scroll)
             .px_3()
-            .py_2()
-            .border_t_1()
-            .border_color(theme.border)
-            .bg(theme.secondary)
+            .pb_2()
             .font_family(theme.mono_font_family.clone())
             .text_xs()
             .children(self.log.iter().map(|entry| {
@@ -738,12 +917,17 @@ impl Workspace {
                 div()
                     .text_color(color)
                     .child(format!("{prefix}{}", entry.text))
-            }))
+            }));
+        Self::panel("LOGS", cx)
+            .h(px(LOG_HEIGHT))
+            .flex_shrink_0()
+            .child(entries)
     }
 }
 
 impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let doc = self.render_doc(cx);
         let resource = self.render_resource(cx);
         let log = self.render_log(cx);
         let status_bar = self.render_status_bar(cx);
@@ -761,15 +945,33 @@ impl Render for Workspace {
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(
-                div()
+                h_flex()
                     .flex_1()
                     .min_h_0()
-                    .font_family(theme.mono_font_family.clone())
-                    .text_size(theme.mono_font_size)
-                    .child(Editor::new(&self.editor).appearance(false).h_full()),
+                    .items_stretch()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_size(theme.mono_font_size)
+                            .child(Editor::new(&self.editor).appearance(false).h_full()),
+                    )
+                    .child(
+                        v_flex()
+                            .w(relative(SIDE_WIDTH))
+                            .flex_shrink_0()
+                            .h_full()
+                            .border_l_1()
+                            .border_color(theme.border)
+                            .bg(theme.secondary)
+                            // The top panel's border would double the window's edge.
+                            .child(doc.border_t_0())
+                            .child(resource)
+                            .child(log),
+                    ),
             )
-            .children(resource)
-            .child(log)
             .child(status_bar)
     }
 }

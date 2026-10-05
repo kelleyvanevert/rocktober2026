@@ -2,6 +2,7 @@ pub mod bundle;
 pub mod clock;
 pub mod control;
 pub mod curve;
+pub mod desc;
 pub mod engine;
 pub mod envelope;
 pub mod eval;
@@ -19,6 +20,7 @@ pub mod sample;
 pub mod scheduler;
 mod session;
 pub mod sidechain;
+pub mod spec;
 pub mod wavetable;
 
 pub use session::Session;

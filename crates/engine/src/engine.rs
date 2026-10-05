@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use rtrb::{Consumer, Producer};
 
-use crate::nodes::{Frame, Node};
+use crate::nodes::{Frame, Limiter, Node};
 use crate::sidechain::Bus;
 
 /// The largest block `Engine::process` handles; the audio callback splits bigger
@@ -23,6 +23,21 @@ const MAX_VOICES: usize = 256;
 const MAX_PENDING: usize = 1024;
 /// Slots that can be ducked under.
 const MAX_BUSES: usize = 32;
+
+/// The limiter on the mix: it looks this far ahead (which delays everything
+/// that much), and recovers over this long. Its ceiling is full scale, so a
+/// mix that wouldn't clip passes through untouched. The release is slow on
+/// purpose: a faster one lets the gain wobble along with the peaks of a
+/// chord (at the differences between its notes), which adds tones of its
+/// own; this way a mix that's too loud is just turned down for a while.
+const MASTER_LOOKAHEAD_SECONDS: f64 = 0.005;
+const MASTER_RELEASE_SECONDS: f64 = 1.0;
+
+/// How many frames late the mix comes out of the engine (the master
+/// limiter's lookahead), after the frame it was timed for.
+pub fn latency(sample_rate: u32) -> usize {
+    (MASTER_LOOKAHEAD_SECONDS * sample_rate as f64).round() as usize
+}
 
 /// A named group of voices (see `Session`), so they can be stopped together.
 /// 0 means none.
@@ -62,6 +77,9 @@ pub struct Status {
     pub commands_received: AtomicU64,
     /// Samples the recorder couldn't keep up with (should stay 0).
     pub recording_dropped: AtomicU64,
+    /// Frames where the mix went over full scale, so the master limiter
+    /// turned it down (without it, they'd have clipped).
+    pub clipped: AtomicU64,
 }
 
 struct Voice {
@@ -95,6 +113,8 @@ pub struct Engine {
     /// The slots whose level is copied to a bus. Their voices are rendered
     /// first, so the bus is full before anything that listens to it runs.
     buses: Vec<(Slot, Arc<Bus>)>,
+    /// Keeps the mix within full scale without clipping it.
+    limiter: Limiter,
 }
 
 impl Engine {
@@ -116,6 +136,11 @@ impl Engine {
             stop_fade: (sample_rate as usize / 100).max(1), // 10 ms
             recorder: None,
             buses: Vec::with_capacity(MAX_BUSES),
+            limiter: Limiter::new(
+                1.0,
+                latency(sample_rate),
+                (MASTER_RELEASE_SECONDS * sample_rate as f64) as f32,
+            ),
         }
     }
 
@@ -225,11 +250,18 @@ impl Engine {
             }
         }
 
-        // Clip here rather than in the device callback, so recordings get
-        // exactly what's heard.
+        // Limit here rather than in the device callback, so recordings get
+        // exactly what's heard. (The clamp only catches rounding.)
+        let mut clipped = 0;
         for frame in out.iter_mut() {
-            frame[0] = frame[0].clamp(-1.0, 1.0);
-            frame[1] = frame[1].clamp(-1.0, 1.0);
+            if frame[0].abs() > 1.0 || frame[1].abs() > 1.0 {
+                clipped += 1;
+            }
+            let [l, r] = self.limiter.step(*frame);
+            *frame = [l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0)];
+        }
+        if clipped > 0 {
+            self.status.clipped.fetch_add(clipped, Ordering::Relaxed);
         }
         if let Some(recorder) = &mut self.recorder {
             let mut dropped = 0;
@@ -319,7 +351,7 @@ mod tests {
     use super::*;
 
     /// Plays 0.5 forever (two of them add up to 1, the most the engine lets
-    /// through).
+    /// through unlimited).
     struct Ones;
     impl Node for Ones {
         fn process(&mut self, out: &mut [Frame]) -> usize {
@@ -335,6 +367,9 @@ mod tests {
         let engine = Engine::new(commands_rx, garbage, Arc::new(Status::default()), 1000);
         (engine, commands)
     }
+
+    /// The master limiter's delay at 1 kHz: 5 ms.
+    const LATE: usize = 5;
 
     fn block(engine: &mut Engine) -> Vec<f32> {
         let mut out = vec![[0.0; 2]; 100];
@@ -353,12 +388,12 @@ mod tests {
         let _ = commands.push(play(130));
         assert_eq!(block(&mut engine), vec![0.0; 100]);
         let second = block(&mut engine);
-        assert_eq!(second[29], 0.0);
-        assert_eq!(second[30], 0.5);
+        assert_eq!(second[29 + LATE], 0.0);
+        assert_eq!(second[30 + LATE], 0.5);
         assert_eq!(engine.status.frames.load(Ordering::Relaxed), 200);
         // In the past: right away.
         let _ = commands.push(play(0));
-        assert_eq!(block(&mut engine)[0], 1.0);
+        assert_eq!(block(&mut engine)[LATE], 1.0);
     }
 
     #[test]
@@ -391,7 +426,7 @@ mod tests {
                 slot,
             });
         }
-        assert_eq!(block(&mut engine)[0], 1.0);
+        assert_eq!(block(&mut engine)[LATE], 1.0);
         let _ = commands.push(Command::StopSlot { slot: 1, at: 150 });
         // A new voice in the same slot, at the same time, isn't stopped.
         let _ = commands.push(Command::Play {
@@ -403,5 +438,38 @@ mod tests {
         // The stop fade (10 ms at 1 kHz) is over well before the third block.
         assert_eq!(block(&mut engine)[50], 1.0);
         assert_eq!(engine.voices.len(), 2);
+    }
+
+    #[test]
+    fn a_mix_over_full_scale_is_limited_not_clipped() {
+        let (mut engine, mut commands) = engine();
+        let play = || Command::Play {
+            node: Box::new(Ones),
+            at: None,
+            slot: 0,
+        };
+        for _ in 0..2 {
+            let _ = commands.push(play());
+        }
+        block(&mut engine);
+        assert_eq!(block(&mut engine)[50], 1.0, "full scale passes untouched");
+        assert_eq!(engine.status.clipped.load(Ordering::Relaxed), 0);
+        // A third makes 1.5: turned down to full scale, smoothly, and counted.
+        let _ = commands.push(play());
+        let out: Vec<f32> = (0..3).flat_map(|_| block(&mut engine)).collect();
+        assert!(out.iter().all(|s| *s <= 1.0));
+        // The gain comes down in the frames before the louder part arrives.
+        assert_eq!(
+            &out[..5],
+            [
+                14.0 / 15.0,
+                13.0 / 15.0,
+                12.0 / 15.0,
+                11.0 / 15.0,
+                10.0 / 15.0
+            ]
+        );
+        assert!((out[250] - 1.0).abs() < 1e-6);
+        assert_eq!(engine.status.clipped.load(Ordering::Relaxed), 300);
     }
 }

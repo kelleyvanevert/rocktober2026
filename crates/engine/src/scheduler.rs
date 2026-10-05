@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::clock::{Clock, Grid};
+use crate::desc::{Control, Sound};
 use crate::engine::Slot;
-use crate::eval::{Control, Sound};
 use crate::nodes::Node;
 use crate::pattern::{Pattern, Step};
 
@@ -35,6 +35,10 @@ struct Running {
     next: usize,
     /// The beat it stops at, once it's been replaced.
     end: Option<f64>,
+    /// Whether it plays a voice per phrase (see `Sound::is_legato`).
+    legato: bool,
+    /// The last note it played, for a glide to slide in from.
+    last: Option<f64>,
 }
 
 /// A voice to start at frame `at`.
@@ -79,12 +83,14 @@ impl Scheduler {
 
     pub fn add(&mut self, pattern: Arc<Pattern>, instrument: Sound, slot: Slot, start: f64) {
         self.running.push(Running {
+            legato: instrument.is_legato(),
             pattern,
             instrument,
             slot,
             start,
             next: 0,
             end: None,
+            last: None,
         });
     }
 
@@ -126,25 +132,31 @@ impl Scheduler {
                     break;
                 }
                 let since = clock.seconds(r.next as f64 * step);
-                let voice = match (r.pattern.glide, &steps[r.next % steps.len()]) {
-                    // Legato: one voice per phrase, its pitch gliding along.
-                    (Some(glide), _) => r.pattern.phrase(r.next).map(|length| {
+                let voice = match (r.legato, &steps[r.next % steps.len()]) {
+                    // Legato: one voice per phrase, its notes changing along
+                    // it (and the glide sliding between them).
+                    (true, _) => r.pattern.phrase(r.next).map(|length| {
                         let path = Control::NotePath {
                             pattern: r.pattern.clone(),
                             start: r.next,
                             step: clock.seconds(step),
-                            glide,
                         };
                         let note = r.pattern.has_notes().then_some(path);
                         let gate = length.map(|n| clock.seconds(n as f64 * step));
-                        r.instrument.for_note(note, gate, since)
+                        r.instrument.for_note(note, gate, since, None)
                     }),
-                    (None, Step::Hit { note, length }) => {
+                    (false, Step::Hit { note, length }) => {
                         let gate = clock.seconds(*length as f64 * step);
-                        let note = note.map(Control::Constant);
-                        Some(r.instrument.for_note(note, Some(gate), since))
+                        let voice = r.instrument.for_note(
+                            note.map(Control::Constant),
+                            Some(gate),
+                            since,
+                            r.last,
+                        );
+                        r.last = note.or(r.last);
+                        Some(voice)
                     }
-                    (None, _) => None,
+                    (false, _) => None,
                 };
                 if let Some(voice) = voice {
                     events.push(Event {
@@ -170,16 +182,28 @@ mod tests {
     use crate::eval::Evaluator;
     use crate::lang::parse;
 
-    /// An instrument (a wavetable with a `?note` hole) and a scheduler.
+    /// An instrument (a wavetable, its note free) and a scheduler.
     fn setup() -> (Sound, Scheduler) {
+        setup_with("wavetable")
+    }
+
+    fn setup_with(instrument: &str) -> (Sound, Scheduler) {
         let mut ev = Evaluator::new(48_000, Bundle::default());
-        let src = r#"notes("c4", 1b).play(wavetable("basic", 0, 0, ?note))"#;
-        let actions = ev.run(&parse(src).unwrap()).unwrap();
+        let src = format!(r#"notes("c4", 1b).play({instrument})"#);
+        let actions = ev.run(&parse(&src).unwrap()).unwrap();
         let Some(crate::eval::Action::Pattern { instrument, .. }) = actions.into_iter().next()
         else {
             panic!()
         };
         (instrument, Scheduler::new(48_000))
+    }
+
+    /// Upward zero crossings in `frames`.
+    fn crossings(frames: &[[f32; 2]]) -> usize {
+        frames
+            .windows(2)
+            .filter(|w| w[0][0] < 0.0 && w[1][0] >= 0.0)
+            .count()
     }
 
     fn pattern(steps: &str) -> Arc<Pattern> {
@@ -247,10 +271,9 @@ mod tests {
     }
 
     #[test]
-    fn gliding_patterns_play_a_voice_per_phrase() {
-        let (lead, mut s) = setup();
+    fn legato_glides_play_a_voice_per_phrase() {
+        let (lead, mut s) = setup_with("wavetable:note(glide(?note):dur(50ms):legato)");
         let mut legato = (*pattern("c4 e4 _ . g4 . c4 c4")).clone();
-        legato.glide = Some(0.05);
         legato.times = 1;
         s.add(Arc::new(legato), lead, 0, 0.0);
         let mut events = s.due(1_000_000);
@@ -259,14 +282,29 @@ mod tests {
         // The first phrase lasts its three steps, gliding from c4 up to e4.
         let mut buf = vec![[0.0; 2]; 100_000];
         assert_eq!(events[0].node.process(&mut buf), 36_000);
-        let crossings = |from: usize, to: usize| {
-            buf[from..to]
-                .windows(2)
-                .filter(|w| w[0][0] < 0.0 && w[1][0] >= 0.0)
-                .count()
-        };
         // c4 is 261.6 Hz, e4 329.6: a quarter second of each.
-        assert!((64..=67).contains(&crossings(0, 12_000)));
-        assert!((81..=84).contains(&crossings(18_000, 30_000)));
+        assert!((64..=67).contains(&crossings(&buf[0..12_000])));
+        assert!((81..=84).contains(&crossings(&buf[18_000..30_000])));
+    }
+
+    #[test]
+    fn glides_slide_each_note_in_from_the_last() {
+        let (lead, mut s) = setup_with("wavetable:note(glide(?note):dur(250ms))");
+        s.add(pattern("c4 c5"), lead, 0, 0.0);
+        let mut events = s.due(20_000);
+        assert_eq!(events.len(), 2, "a voice per note");
+        let mut first = vec![[0.0; 2]; 12_000];
+        let mut second = vec![[0.0; 2]; 12_000];
+        events[0].node.process(&mut first);
+        events[1].node.process(&mut second);
+        // The first note has none before it: c4 all along (261.6 Hz, so 65
+        // cycles in a quarter second). The second slides up an octave from
+        // c4 over its quarter second, evenly in pitch: 1 / ln 2 times as many.
+        assert!((64..=66).contains(&crossings(&first)));
+        assert!(
+            (92..=97).contains(&crossings(&second)),
+            "{}",
+            crossings(&second)
+        );
     }
 }

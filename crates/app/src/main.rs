@@ -27,7 +27,7 @@ fn main() {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
-                    size(px(1000.), px(720.)),
+                    size(px(1280.), px(800.)),
                     cx,
                 ))),
                 titlebar: Some(TitlebarOptions {

@@ -1,6 +1,7 @@
 pub mod blocks;
 pub mod comments;
 pub mod curve_view;
+pub mod docs;
 pub mod envelope_editor;
 pub mod modulation_editor;
 pub mod sample_editor;

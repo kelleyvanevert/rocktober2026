@@ -465,6 +465,70 @@ impl ControlNode for NotePath {
     }
 }
 
+/// Follows its input, but slides to each new value in a straight line over
+/// `frames` instead of jumping to it. With `from` (the note before, in a
+/// pattern), it starts there and slides in. On an input that keeps changing
+/// (a modulation) it lags behind, smoothing it.
+pub struct Glide {
+    input: Box<dyn ControlNode>,
+    frames: f32,
+    from: Option<f32>,
+    started: bool,
+    /// The current slide: from where, to where, and how far along.
+    start: f32,
+    target: f32,
+    since: f32,
+    value: f32,
+}
+
+impl Glide {
+    pub fn new(input: Box<dyn ControlNode>, frames: f32, from: Option<f32>) -> Self {
+        Self {
+            input,
+            frames: frames.max(1.0),
+            from,
+            started: false,
+            start: 0.0,
+            target: 0.0,
+            since: 0.0,
+            value: 0.0,
+        }
+    }
+}
+
+impl ControlNode for Glide {
+    fn process(&mut self, out: &mut [f32]) -> usize {
+        let n = self.input.process(out);
+        for x in &mut out[..n] {
+            if !self.started {
+                self.started = true;
+                self.value = self.from.unwrap_or(*x);
+                self.target = self.value;
+            }
+            if *x != self.target {
+                self.start = self.value;
+                self.target = *x;
+                self.since = 0.0;
+            }
+            if self.value != self.target {
+                self.since += 1.0;
+                self.value = if self.since >= self.frames {
+                    self.target
+                } else {
+                    self.start + (self.target - self.start) * self.since / self.frames
+                };
+            }
+            *x = self.value;
+        }
+        n
+    }
+
+    fn reset(&mut self) {
+        self.input.reset();
+        self.started = false;
+    }
+}
+
 /// A numeric parameter of an audio node: a constant, or a control signal
 /// computed a block at a time.
 pub enum Param {
@@ -680,6 +744,21 @@ mod tests {
         // From the third step on: starts right on e4.
         let out = render(&mut NotePath::new(pattern, 2, 4.0, 2.0), 2);
         assert_eq!(out, [64.0, 64.0]);
+    }
+
+    #[test]
+    fn glide_slides_in_and_between_values() {
+        let path = |from| Glide::new(Box::new(Constant(10.0)), 4.0, from);
+        assert_eq!(
+            render(&mut path(Some(2.0)), 6),
+            [4.0, 6.0, 8.0, 10.0, 10.0, 10.0]
+        );
+        assert_eq!(render(&mut path(None), 3), [10.0, 10.0, 10.0]);
+        // A ramp from 0 to 1 over 40 frames lags a little behind.
+        let mut ramp = Glide::new(Box::new(ModulationPlayer::new(ramp(), 1, 0, 10)), 2.0, None);
+        let out = render(&mut ramp, 50);
+        assert!(out[20] < 0.5 && out[20] > 0.4, "{out:?}");
+        assert!((out[49] - 1.0).abs() < 0.01, "{out:?}");
     }
 
     #[test]

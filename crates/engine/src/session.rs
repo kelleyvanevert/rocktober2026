@@ -129,7 +129,7 @@ enum Output {
     #[allow(dead_code)]
     Device(cpal::Stream),
     // No device: the engine only runs when `render` asks.
-    None(Engine),
+    None(Box<Engine>),
 }
 
 impl Session {
@@ -203,7 +203,7 @@ impl Session {
             status,
             evaluator: Evaluator::new(sample_rate, bundle),
             recording: None,
-            output: Output::None(engine),
+            output: Output::None(Box::new(engine)),
             margin: 0,
             buses: HashSet::new(),
         }
@@ -315,6 +315,12 @@ impl Session {
         (clock.bpm(), clock.beat_at(now))
     }
 
+    /// Documentation for a name: a value named with `let` (with the params
+    /// still free in it), or a built-in.
+    pub fn describe(&self, name: &str) -> Option<crate::spec::Doc> {
+        self.evaluator.describe(name)
+    }
+
     /// The resources in the `.rock` file: its samples, envelopes, ...
     pub fn bundle(&self) -> &Bundle {
         self.evaluator.bundle()
@@ -325,6 +331,12 @@ impl Session {
         let mut shared = self.shared();
         shared.scheduler.clear();
         shared.send(Command::StopAll);
+    }
+
+    /// How many frames so far went over full scale, and were turned down by
+    /// the master limiter (they'd have clipped). It only goes up.
+    pub fn clipped(&self) -> u64 {
+        self.status.clipped.load(Ordering::Relaxed)
     }
 
     /// Number of voices currently playing.
@@ -470,7 +482,8 @@ mod tests {
     }
 
     /// The whole path, without a device: evaluate a pattern, then render,
-    /// which alternates the scheduler's work with the audio thread's.
+    /// which alternates the scheduler's work with the audio thread's. (The
+    /// output is the master limiter's lookahead late.)
     #[test]
     fn pattern_hits_land_on_their_frames() {
         let mut session = Session::without_output(48_000, Bundle::with_kick());
@@ -481,7 +494,8 @@ mod tests {
             .eval(r#"notes("x", 1b).play(sample("kick.mp3").fit(10ms), at 1bar)"#)
             .unwrap();
         let out = session.render(200_000);
-        let at: Vec<usize> = onsets(&out).iter().map(|i| i + 10_000).collect();
+        let late = crate::engine::latency(48_000);
+        let at: Vec<usize> = onsets(&out).iter().map(|i| i + 10_000 - late).collect();
         assert_eq!(at, [96_000, 120_000, 144_000, 168_000, 192_000]);
     }
 
@@ -498,7 +512,8 @@ mod tests {
         // Right away, and on beat 2 (frame 48000), then the next one on the
         // grid is beat 7.
         let out = session.render(150_000);
-        let at: Vec<usize> = onsets(&out).iter().map(|i| i + 30_000).collect();
+        let late = crate::engine::latency(48_000);
+        let at: Vec<usize> = onsets(&out).iter().map(|i| i + 30_000 - late).collect();
         assert_eq!(at, [30_000, 48_000 + 4_800]);
         assert_eq!(
             session.stop_named(r#"x.play("a", at 5b + 2)"#).unwrap(),
@@ -517,7 +532,7 @@ mod tests {
         // A steady tone, ducked under a kick on every beat; minus the kicks,
         // that leaves the ducked tone.
         let mix = render(&format!(
-            "wavetable(\"basic\", 0, 0, a4).duck(\"kick\", 1, 50ms).play\n{kicks}"
+            "(sine:note(a4) * duck(\"kick\", 1, 50ms)).play\n{kicks}"
         ));
         let kick = render(kicks);
         let tone: Vec<f32> = mix.iter().zip(&kick).map(|(m, k)| m[0] - k[0]).collect();

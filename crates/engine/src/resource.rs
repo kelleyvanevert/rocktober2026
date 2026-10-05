@@ -30,7 +30,7 @@ impl ResourceKind {
         match self {
             ResourceKind::Sample => "sample",
             ResourceKind::Envelope => "envelope",
-            ResourceKind::Modulation => "modulation",
+            ResourceKind::Modulation => "mod",
             ResourceKind::Wavetable => "wavetable",
             ResourceKind::Midi => "midi",
         }
