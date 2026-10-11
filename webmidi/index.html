@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>webmidi livecode</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>webmidi livecode</h1>
+
+      <section class="row">
+        <label>
+          MIDI output
+          <select id="output"><option>(requesting access…)</option></select>
+        </label>
+        <label>
+          Channel
+          <select id="channel"></select>
+        </label>
+        <label>
+          BPM
+          <input id="bpm" type="number" min="40" max="300" value="120" />
+        </label>
+      </section>
+
+      <section class="row">
+        <button id="start">▶ Start</button>
+        <button id="stop" disabled>■ Stop</button>
+        <button id="panic" title="Send all-notes-off on every channel">Panic</button>
+      </section>
+
+      <section id="steps" class="steps"></section>
+
+      <p id="status" class="status"></p>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

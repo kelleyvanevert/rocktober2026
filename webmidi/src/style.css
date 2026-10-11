@@ -1,0 +1,107 @@
+:root {
+  color-scheme: dark;
+  --bg: #111;
+  --fg: #eee;
+  --muted: #888;
+  --accent: #ff5a1f;
+  --cell: #2a2a2a;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+main {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 24px 16px;
+}
+
+h1 {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 16px;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+select,
+input,
+button {
+  font: inherit;
+  font-size: 14px;
+  background: #1c1c1c;
+  color: var(--fg);
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 6px 10px;
+}
+
+input[type="number"] {
+  width: 70px;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+#start:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.steps {
+  display: grid;
+  grid-template-columns: 48px repeat(16, 1fr);
+  gap: 3px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.steps .name {
+  align-self: center;
+}
+
+.steps .cell {
+  aspect-ratio: 1;
+  background: var(--cell);
+  border-radius: 2px;
+}
+
+.steps .cell.on {
+  background: #666;
+}
+
+.steps .cell.now {
+  outline: 1px solid var(--fg);
+}
+
+.steps .cell.on.now {
+  background: var(--accent);
+}
+
+.status {
+  margin-top: 16px;
+  font-size: 12px;
+  color: var(--muted);
+}
