@@ -6,21 +6,29 @@
 //            | "every" expr block
 //            | "if" expr block ["else" (block | if-stmt)]
 //            | "spawn" block
+//            | "once" block                    -- only on the automaton's first frame
+//            | "value" expr
 //   block   := "{" program "}"
 //   expr    := sum [(">=" | "<=" | ">" | "<" | "==" | "!=") sum]
 //   sum     := product (("+" | "-") product)*
 //   product := unary (("*" | "/" | "%") unary)*
-//   unary   := "-" unary | NUMBER | NOTE | "hit" | "frame" | "(" expr ")"
+//   unary   := "-" unary | NUMBER | NOTE | VAR | rand | "(" expr ")"
+//   rand    := "rand" ["(" expr "," expr ")"]   -- random int, both ends inclusive; default 0..8
+//   VAR     := "hit" | "hitv" | "value" | "frame"
 //
 // Comments start with "--". Note names use Ableton's convention: c3 = 60.
+
+export type Var = "hit" | "hitv" | "value" | "frame";
+const VARS: string[] = ["hit", "hitv", "value", "frame"] satisfies Var[];
 
 export type Dir = "left" | "right" | "up" | "down";
 export type BinOp = "+" | "-" | "*" | "/" | "%" | ">=" | "<=" | ">" | "<" | "==" | "!=";
 
 export type Expr =
   | { kind: "num"; value: number }
-  | { kind: "var"; name: "hit" | "frame" }
+  | { kind: "var"; name: Var }
   | { kind: "neg"; arg: Expr }
+  | { kind: "rand"; min: Expr; max: Expr }
   | { kind: "bin"; op: BinOp; left: Expr; right: Expr };
 
 export type Stmt =
@@ -28,7 +36,9 @@ export type Stmt =
   | { kind: "note"; note: Expr; dur: Expr | null; channel: Expr | null }
   | { kind: "every"; n: Expr; body: Program }
   | { kind: "if"; cond: Expr; then: Program; else: Program | null }
-  | { kind: "spawn"; body: Program; source: string };
+  | { kind: "spawn"; body: Program; source: string }
+  | { kind: "value"; value: Expr }
+  | { kind: "once"; body: Program };
 
 export type Program = Stmt[];
 
@@ -51,7 +61,7 @@ export function noteNumber(name: string): number | null {
 type Token = { type: "num" | "note" | "ident" | "op" | "eof"; text: string; pos: number };
 
 const TOKEN =
-  /(\s+|--[^\n]*)|(\d+(?:\.\d+)?)|([a-gA-G](?:#|b)?-?\d+)(?![\w#])|([a-zA-Z_]\w*)|(>=|<=|==|!=|[-+*/%(){}<>;])/y;
+  /(\s+|--[^\n]*)|(\d+(?:\.\d+)?)|([a-gA-G](?:#|b)?-?\d+)(?![\w#])|([a-zA-Z_]\w*)|(>=|<=|==|!=|[-+*/%(){}<>;,])/y;
 
 function lex(src: string): Token[] {
   const tokens: Token[] = [];
@@ -135,6 +145,10 @@ export function parse(src: string): Program {
         return { kind: "every", n: expr(), body: block() };
       case "if":
         return ifStmt();
+      case "value":
+        return { kind: "value", value: expr() };
+      case "once":
+        return { kind: "once", body: block() };
       case "spawn": {
         const open = peek().pos;
         const body = block();
@@ -157,7 +171,7 @@ export function parse(src: string): Program {
   // A trailing count is optional, so only treat unambiguous tokens as its start.
   function startsExpr() {
     const t = peek();
-    return t.type === "num" || t.type === "note" || t.text === "(" || t.text === "hit" || t.text === "frame";
+    return t.type === "num" || t.type === "note" || t.text === "(" || t.text === "rand" || VARS.includes(t.text);
   }
 
   function expr(): Expr {
@@ -193,7 +207,15 @@ export function parse(src: string): Program {
     if (tok.text === "-" && tok.type === "op") return { kind: "neg", arg: unary() };
     if (tok.type === "num") return { kind: "num", value: Number(tok.text) };
     if (tok.type === "note") return { kind: "num", value: noteNumber(tok.text)! };
-    if (tok.text === "hit" || tok.text === "frame") return { kind: "var", name: tok.text };
+    if (VARS.includes(tok.text)) return { kind: "var", name: tok.text as Var };
+    if (tok.text === "rand") {
+      if (!accept("(")) return { kind: "rand", min: { kind: "num", value: 0 }, max: { kind: "num", value: 8 } };
+      const min = expr();
+      expect(",");
+      const max = expr();
+      expect(")");
+      return { kind: "rand", min, max };
+    }
     if (/^[a-g](#|b)?$/i.test(tok.text)) fail(`note '${tok.text}' needs an octave, e.g. ${tok.text}3`, tok);
     if (tok.text === "(") {
       const e = expr();

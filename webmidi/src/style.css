@@ -148,6 +148,11 @@ body {
   color: var(--muted);
 }
 
+.automaton .value {
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+
 .automaton .status {
   flex: 1;
   color: var(--accent);

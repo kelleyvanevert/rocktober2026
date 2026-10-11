@@ -17,6 +17,10 @@ if hit >= 2 { … } else { … }
 note c3 + hit * 7
                 hit, frame are numbers
 spawn { … }     new automaton, same cell
+once { … }      only on its first frame
+value c3        set own value (starts at 0)
+note value + hitv   hitv: sum of others' values
+note c3 + rand(0, 5)  random int 0-5 (rand = 0-8)
 step up; note c3  ";" separates (optional)
 -- comment
 
@@ -103,6 +107,7 @@ export class Sidebar {
     const here = new Set(ids.filter((id) => this.lookup(id)));
 
     for (const [id, item] of this.items) {
+      item.setValue(this.lookup(id)?.value);
       if (here.has(id)) item.setStatus("");
       else if (item.editing) item.setStatus(this.lookup(id) ? "moved away" : "removed");
       else {
@@ -118,6 +123,7 @@ export class Sidebar {
       let item = this.items.get(id);
       if (!item) {
         item = new Item(id, this.lookup(id)!.code, this);
+        item.setValue(this.lookup(id)?.value);
         this.items.set(id, item);
       }
       if (this.list.children[i] !== item.el) this.list.insertBefore(item.el, this.list.children[i] ?? null);
@@ -137,6 +143,7 @@ class Item {
   el = document.createElement("li");
   editing = false;
   private status: HTMLElement;
+  private value: HTMLElement;
   private view: HTMLElement;
   private editor: HTMLElement;
   private textarea: HTMLTextAreaElement;
@@ -151,6 +158,7 @@ class Item {
     this.el.innerHTML = `
       <div class="head">
         <span class="id">#${id}</span>
+        <span class="value" title="value"></span>
         <span class="status"></span>
         <button class="delete" title="Delete">×</button>
       </div>
@@ -166,6 +174,7 @@ class Item {
       </div>`;
     const $ = <T extends HTMLElement>(sel: string) => this.el.querySelector(sel) as T;
     this.status = $(".status");
+    this.value = $(".value");
     this.view = $("pre.code");
     this.editor = $(".editor");
     this.textarea = $("textarea");
@@ -182,6 +191,11 @@ class Item {
 
   setStatus(text: string) {
     this.status.textContent = text;
+  }
+
+  setValue(value: number | undefined) {
+    const text = value === undefined ? "" : `v=${+value.toFixed(3)}`;
+    if (this.value.textContent !== text) this.value.textContent = text;
   }
 
   private edit() {

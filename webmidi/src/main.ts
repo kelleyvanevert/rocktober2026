@@ -110,6 +110,7 @@ sidebar.onUpdate = (id, code) => {
     return (err as Error).message;
   }
   a.code = code;
+  a.started = false; // new code: let its `once` blocks run
   save();
   return null;
 };
@@ -242,7 +243,7 @@ function restore() {
   try {
     const data = JSON.parse(raw);
     world.frame = data.frame ?? 0;
-    for (const { col, row, code } of data.automatons ?? []) {
+    for (const { col, row, code, value, started } of data.automatons ?? []) {
       // Keep code that no longer parses (the language may have changed) as an inactive
       // automaton, so it can be fixed instead of silently disappearing.
       let program: Program = [];
@@ -251,7 +252,7 @@ function restore() {
       } catch {
         broken++;
       }
-      world.add(col, row, program, code);
+      world.add(col, row, program, code, value ?? 0, started ?? true);
     }
     if (data.bpm) {
       scheduler.bpm = data.bpm;
