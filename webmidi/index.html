@@ -7,34 +7,29 @@
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
-    <main>
-      <h1>webmidi livecode</h1>
+    <div class="stage"><canvas id="grid"></canvas></div>
 
-      <section class="row">
-        <label>
-          MIDI output
-          <select id="output"><option>(requesting access…)</option></select>
-        </label>
-        <label>
-          Channel
-          <select id="channel"></select>
-        </label>
-        <label>
-          BPM
-          <input id="bpm" type="number" min="40" max="300" value="120" />
-        </label>
-      </section>
+    <aside id="sidebar" class="sidebar"></aside>
 
-      <section class="row">
-        <button id="start">▶ Start</button>
-        <button id="stop" disabled>■ Stop</button>
-        <button id="panic" title="Send all-notes-off on every channel">Panic</button>
-      </section>
+    <footer class="bar">
+      <button id="play" title="Play / pause (space)">▶</button>
+      <button id="clear" title="Remove all automatons and reset the frame counter">clear</button>
+      <button id="panic" title="Stop every sounding note on every MIDI output">panic</button>
+      <span class="frame">frame <span id="frame">0</span></span>
+      <label>
+        out
+        <select id="output"><option>(requesting access…)</option></select>
+      </label>
+      <label>
+        bpm
+        <input id="bpm" type="number" min="40" max="300" value="120" />
+      </label>
+      <span id="status" class="status"></span>
+      <span class="spacer"></span>
+      <button id="zoom-out" title="Zoom out (⌘−)">−</button>
+      <button id="zoom-in" title="Zoom in (⌘+)">+</button>
+    </footer>
 
-      <section id="steps" class="steps"></section>
-
-      <p id="status" class="status"></p>
-    </main>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

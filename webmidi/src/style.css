@@ -1,43 +1,222 @@
 :root {
   color-scheme: dark;
   --bg: #111;
+  --bar: #181818;
+  --line: #2a2a2a;
   --fg: #eee;
   --muted: #888;
   --accent: #ff5a1f;
-  --cell: #2a2a2a;
+  --error: #ff6b6b;
+  --bar-height: 44px;
+  --sidebar-width: min(340px, 45vw);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
 }
 
+html,
 body {
   margin: 0;
+  height: 100%;
+  overflow: hidden;
   background: var(--bg);
   color: var(--fg);
 }
 
-main {
-  max-width: 720px;
-  margin: 0 auto;
-  padding: 24px 16px;
+body {
+  display: grid;
+  grid-template:
+    "stage sidebar" 1fr
+    "bar   bar" var(--bar-height)
+    / 1fr var(--sidebar-width);
 }
 
-h1 {
-  font-size: 18px;
+/* The wrapper gives the canvas a size without the canvas influencing the layout. */
+.stage {
+  grid-area: stage;
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+}
+
+#grid {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: pointer;
+  touch-action: none;
+}
+
+/* --- Sidebar --- */
+
+.sidebar {
+  grid-area: sidebar;
+  min-height: 0;
+  overflow-y: auto;
+  box-sizing: border-box;
+  padding: 16px;
+  background: var(--bar);
+  border-left: 1px solid var(--line);
+  font-size: 13px;
+}
+
+.help {
+  margin: 0;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+  white-space: pre;
+}
+
+.cell-panel h2 {
+  margin: 0 0 14px;
+  font-size: 13px;
   font-weight: 600;
 }
 
-.row {
+.cell-panel h2 .coords {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+.cell-panel h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: normal;
+  color: var(--muted);
+}
+
+.sidebar textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 8px;
+  tab-size: 2;
+}
+
+.sidebar textarea:focus {
+  outline: none;
+  border-color: #555;
+}
+
+.sidebar .error {
+  min-height: 1.4em;
+  margin: 6px 0;
+  color: var(--error);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.sidebar .actions {
   display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  align-items: end;
-  margin-bottom: 16px;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel {
+  margin-bottom: 20px;
+}
+
+.automatons {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.automaton {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 6px 8px 8px;
+}
+
+.automaton .head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.automaton .status {
+  flex: 1;
+  color: var(--accent);
+}
+
+.automaton .delete {
+  min-width: 0;
+  padding: 0 7px;
+  line-height: 1.4;
+  border-color: transparent;
+  background: none;
+  color: var(--muted);
+}
+
+.automaton .delete:hover {
+  color: var(--error);
+  border-color: #333;
+}
+
+.automaton pre.code {
+  margin: 4px 0 0;
+  padding: 4px;
+  border-radius: 3px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  cursor: text;
+}
+
+.automaton pre.code:hover {
+  background: #222;
+}
+
+.automaton .editor {
+  margin-top: 6px;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* --- Bottom bar --- */
+
+.bar {
+  grid-area: bar;
+  box-sizing: border-box;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bar);
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+}
+
+.bar > * {
+  flex-shrink: 0;
+}
+
+.bar > .status {
+  flex-shrink: 1;
 }
 
 label {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
+  align-items: center;
+  gap: 6px;
   color: var(--muted);
 }
 
@@ -45,63 +224,50 @@ select,
 input,
 button {
   font: inherit;
-  font-size: 14px;
-  background: #1c1c1c;
+  background: #222;
   color: var(--fg);
   border: 1px solid #333;
   border-radius: 4px;
-  padding: 6px 10px;
+  padding: 4px 8px;
+}
+
+select {
+  max-width: 220px;
 }
 
 input[type="number"] {
-  width: 70px;
+  width: 56px;
 }
 
 button {
   cursor: pointer;
+  min-width: 30px;
 }
 
-button:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-
-#start:not(:disabled) {
+#play.playing,
+button.primary {
   border-color: var(--accent);
 }
 
-.steps {
-  display: grid;
-  grid-template-columns: 48px repeat(16, 1fr);
-  gap: 3px;
-  font-size: 11px;
+.frame {
   color: var(--muted);
+  min-width: 11ch;
+  font-variant-numeric: tabular-nums;
 }
 
-.steps .name {
-  align-self: center;
+#frame {
+  color: var(--fg);
 }
 
-.steps .cell {
-  aspect-ratio: 1;
-  background: var(--cell);
-  border-radius: 2px;
-}
-
-.steps .cell.on {
-  background: #666;
-}
-
-.steps .cell.now {
-  outline: 1px solid var(--fg);
-}
-
-.steps .cell.on.now {
-  background: var(--accent);
+.spacer {
+  flex: 1;
 }
 
 .status {
-  margin-top: 16px;
-  font-size: 12px;
   color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }

@@ -34,3 +34,39 @@ export function panic(out: MIDIOutput) {
     out.send([0xb0 | ch, 120, 0]); // all sound off
   }
 }
+
+/** One number per (channel 1-16, note) pair, for use as a map key. */
+export const noteKey = (channel: number, note: number) => (channel - 1) * 128 + note;
+const fromNoteKey = (key: number) => [Math.floor(key / 128) + 1, key % 128] as const;
+
+/**
+ * Tracks sounding notes and releases them on frame boundaries. Note-offs are sent
+ * per frame instead of being scheduled up front, so a retriggered note can't be cut
+ * short by the note-off of an earlier, shorter note of the same pitch.
+ */
+export class Voices {
+  /** noteKey -> frame at which it ends */
+  private ends = new Map<number, number>();
+
+  /** `notes` maps noteKey(channel, note) -> duration in frames. */
+  frame(out: MIDIOutput | undefined, frame: number, time: number, notes: Map<number, number>) {
+    for (const [key, end] of this.ends) {
+      if (end > frame) continue;
+      if (out) noteOff(out, ...fromNoteKey(key), time);
+      this.ends.delete(key);
+    }
+    for (const [key, dur] of notes) {
+      if (out) {
+        const [ch, note] = fromNoteKey(key);
+        if (this.ends.has(key)) noteOff(out, ch, note, time);
+        noteOn(out, ch, note, 100, time);
+      }
+      this.ends.set(key, frame + dur);
+    }
+  }
+
+  releaseAll(out: MIDIOutput | undefined, time?: number) {
+    if (out) for (const key of this.ends.keys()) noteOff(out, ...fromNoteKey(key), time);
+    this.ends.clear();
+  }
+}

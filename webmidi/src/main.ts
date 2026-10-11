@@ -1,124 +1,319 @@
-import { initMidi, listOutputs, getOutput, noteOn, noteOff, panic } from "./midi";
+import { initMidi, listOutputs, getOutput, panic, Voices } from "./midi";
 import { Scheduler } from "./scheduler";
-
-// The beat. Notes follow Ableton's Drum Rack layout (C1 = 36).
-// "x" = hit, "-" = rest; one character per 16th note.
-const pattern = [
-  { name: "kick", note: 36, steps: "x---x---x---x---" },
-  { name: "snare", note: 38, steps: "----x-------x---" },
-  { name: "hat", note: 42, steps: "--x---x---x---xx" },
-];
+import { Grid, type Cell } from "./grid";
+import { Sidebar } from "./sidebar";
+import { World, cellKey, type View } from "./world";
+import { parse, type Program } from "./lang";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const outputSel = $<HTMLSelectElement>("output");
-const channelSel = $<HTMLSelectElement>("channel");
 const bpmInput = $<HTMLInputElement>("bpm");
-const startBtn = $<HTMLButtonElement>("start");
-const stopBtn = $<HTMLButtonElement>("stop");
+const playBtn = $<HTMLButtonElement>("play");
+const clearBtn = $<HTMLButtonElement>("clear");
 const panicBtn = $<HTMLButtonElement>("panic");
-const stepsEl = $<HTMLElement>("steps");
+const zoomInBtn = $<HTMLButtonElement>("zoom-in");
+const zoomOutBtn = $<HTMLButtonElement>("zoom-out");
+const frameEl = $<HTMLElement>("frame");
 const statusEl = $<HTMLElement>("status");
+
+// Bottom-bar messages, one slot per topic so they don't overwrite each other.
+const statusMessages = new Map<string, string>();
+function setStatus(topic: string, message: string | null) {
+  if (message) statusMessages.set(topic, message);
+  else statusMessages.delete(topic);
+  statusEl.textContent = [...statusMessages.values()].join(" · ");
+}
 
 const store = {
   get: (k: string) => { try { return localStorage.getItem(k); } catch { return null; } },
   set: (k: string, v: string) => { try { localStorage.setItem(k, v); } catch {} },
 };
 
-// --- UI setup ---
+const world = new World();
+const voices = new Voices();
 
-for (let ch = 1; ch <= 16; ch++) channelSel.add(new Option(String(ch), String(ch)));
-channelSel.value = store.get("channel") ?? "1";
-channelSel.onchange = () => store.set("channel", channelSel.value);
+// --- Grid ---
 
-const cells: HTMLElement[][] = pattern.map((track) => {
-  const name = document.createElement("div");
-  name.className = "name";
-  name.textContent = track.name;
-  stepsEl.append(name);
-  return [...track.steps].map((c) => {
-    const cell = document.createElement("div");
-    cell.className = "cell" + (c === "x" ? " on" : "");
-    stepsEl.append(cell);
-    return cell;
-  });
-});
+const grid = new Grid($<HTMLCanvasElement>("grid"));
+grid.setSize(Number(store.get("zoom")) || grid.size);
 
-function highlight(step: number | null) {
-  for (const row of cells) row.forEach((cell, i) => cell.classList.toggle("now", i === step));
+function display(view: View) {
+  grid.show(view);
+  frameEl.textContent = String(view.frame);
+  sidebar.refresh(idsAt(grid.selected));
 }
 
+const showWorld = () => display(world.view());
+
+/** Automatons shown on a cell (in the displayed frame, which may lag the world slightly). */
+function idsAt(cell: Cell | null): number[] {
+  return (cell && grid.view?.cells.get(cellKey(cell.col, cell.row))?.ids) || [];
+}
+
+/** After an edit: redraw now when paused; when playing, the next frame shows it. */
+function changed() {
+  save();
+  if (scheduler.running) sidebar.refresh(idsAt(grid.selected));
+  else showWorld();
+}
+
+function zoom(dir: 1 | -1) {
+  if (dir > 0) grid.zoomIn();
+  else grid.zoomOut();
+  store.set("zoom", String(grid.size));
+}
+
+zoomInBtn.onclick = () => zoom(1);
+zoomOutBtn.onclick = () => zoom(-1);
+
+// Trackpad pinch arrives as a ctrl+wheel event.
+window.addEventListener(
+  "wheel",
+  (e) => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    grid.setSize(grid.size * Math.exp(-e.deltaY * 0.01));
+    store.set("zoom", String(grid.size));
+  },
+  { passive: false },
+);
+
+// --- Sidebar ---
+
+const sidebar = new Sidebar($("sidebar"), store.get("draft") ?? "step right\nnote c3", (code) =>
+  store.set("draft", code),
+);
+
+grid.onSelect = (cell) => {
+  sidebar.show(cell);
+  sidebar.refresh(idsAt(cell));
+};
+
+sidebar.lookup = (id) => world.get(id);
+
+sidebar.onCreate = (cell, code) => {
+  try {
+    world.add(cell.col, cell.row, parse(code), code);
+  } catch (err) {
+    return (err as Error).message;
+  }
+  changed();
+  return null;
+};
+
+sidebar.onUpdate = (id, code) => {
+  const a = world.get(id);
+  if (!a) return "this automaton no longer exists";
+  try {
+    a.program = parse(code);
+  } catch (err) {
+    return (err as Error).message;
+  }
+  a.code = code;
+  save();
+  return null;
+};
+
+sidebar.onDelete = (id) => {
+  world.remove([id]);
+  changed();
+};
+
+// --- MIDI outputs ---
+
+// Ports that come with the OS rather than leading somewhere external.
+const BUILT_IN = /microsoft gs wavetable|midi through/i;
+
+/** (Re)fill the output list on load and whenever devices come or go. */
 function refreshOutputs() {
   const outputs = listOutputs();
-  const previous = outputSel.value || store.get("output");
+  const wanted = [currentOutput, store.get("output")];
   outputSel.replaceChildren(
     ...(outputs.length
       ? outputs.map((o) => new Option(o.name ?? o.id, o.id))
       : [new Option("(no MIDI outputs found)", "")]),
   );
-  if (previous && outputs.some((o) => o.id === previous)) outputSel.value = previous;
+  // Keep the current (or remembered) choice if it's there, else prefer an external port.
+  const pick =
+    outputs.find((o) => wanted.includes(o.id)) ??
+    outputs.find((o) => !BUILT_IN.test(o.name ?? "")) ??
+    outputs[0];
+  if (pick) outputSel.value = pick.id;
+  currentOutput = outputSel.value;
+  if (pick) setStatus("output", null);
 }
 
-outputSel.onchange = () => store.set("output", outputSel.value);
+let currentOutput = "";
+outputSel.onchange = () => {
+  const old = getOutput(currentOutput);
+  if (old) panic(old);
+  voices.releaseAll(undefined);
+  currentOutput = outputSel.value;
+  store.set("output", outputSel.value);
+  setStatus("output", null);
+  outputSel.blur(); // so space goes back to play/pause
+};
 
 // --- Playback ---
 
-const scheduler = new Scheduler((step, time, dur) => {
-  const out = getOutput(outputSel.value);
-  const ch = Number(channelSel.value);
-  const i = step % 16;
+// Bumped on pause/clear so already-queued playhead updates are dropped.
+let generation = 0;
 
-  if (out) {
-    for (const track of pattern) {
-      if (track.steps[i] !== "x") continue;
-      noteOn(out, ch, track.note, 100, time);
-      noteOff(out, ch, track.note, time + dur * 0.9);
-    }
-  }
+const scheduler = new Scheduler((time) => {
+  const { view, notes } = world.step(grid.cols, grid.rows);
+  voices.frame(getOutput(outputSel.value), view.frame, time, notes);
+  save();
 
-  // Move the playhead when the step actually sounds, not when it's scheduled.
-  setTimeout(() => scheduler.running && highlight(i), time - performance.now());
+  // Show the frame when it actually sounds, not when it's scheduled.
+  const gen = generation;
+  setTimeout(() => gen === generation && display(view), time - performance.now());
+});
+
+function play() {
+  setStatus("output", getOutput(outputSel.value) ? null : "no MIDI output selected");
+  scheduler.start();
+  playBtn.textContent = "❚❚";
+  playBtn.classList.add("playing");
+}
+
+function pause() {
+  scheduler.stop();
+  generation++;
+  // Note-ons up to `lookahead` ms ahead are already queued in the browser, so release
+  // everything right after the last of them.
+  voices.releaseAll(getOutput(outputSel.value), scheduler.nextTime);
+  showWorld();
+  playBtn.textContent = "▶";
+  playBtn.classList.remove("playing");
+}
+
+const togglePlay = () => (scheduler.running ? pause() : play());
+
+playBtn.onclick = togglePlay;
+/** Silence every note on every output (playback keeps going if it was running). */
+function panicAll() {
+  listOutputs().forEach(panic);
+  voices.releaseAll(undefined);
+}
+
+panicBtn.onclick = panicAll;
+
+clearBtn.onclick = () => {
+  if (scheduler.running) pause();
+  world.clear();
+  showWorld();
+  save();
+};
+
+// Keep focus off buttons, so space and arrows never act on them.
+document.addEventListener("mousedown", (e) => {
+  if ((e.target as Element).closest("button")) e.preventDefault();
 });
 
 bpmInput.oninput = () => {
   const bpm = Number(bpmInput.value);
   if (bpm >= 20 && bpm <= 400) scheduler.bpm = bpm;
+  save();
+};
+bpmInput.onchange = () => bpmInput.blur(); // on enter, hand keys back to the grid
+
+// --- Autosave ---
+
+const SAVE_KEY = "composition";
+let saveTimer = 0;
+
+function saveNow() {
+  clearTimeout(saveTimer);
+  saveTimer = 0;
+  store.set(SAVE_KEY, JSON.stringify({ bpm: scheduler.bpm, ...world.save() }));
+}
+
+/** Coalesced: saves at most once a second, since playing changes the world every frame. */
+function save() {
+  if (!saveTimer) saveTimer = window.setTimeout(saveNow, 1000);
+}
+
+window.addEventListener("pagehide", saveNow);
+
+function restore() {
+  const raw = store.get(SAVE_KEY);
+  if (!raw) return;
+  let broken = 0;
+  try {
+    const data = JSON.parse(raw);
+    world.frame = data.frame ?? 0;
+    for (const { col, row, code } of data.automatons ?? []) {
+      // Keep code that no longer parses (the language may have changed) as an inactive
+      // automaton, so it can be fixed instead of silently disappearing.
+      let program: Program = [];
+      try {
+        program = parse(code);
+      } catch {
+        broken++;
+      }
+      world.add(col, row, program, code);
+    }
+    if (data.bpm) {
+      scheduler.bpm = data.bpm;
+      bpmInput.value = String(data.bpm);
+    }
+  } catch (err) {
+    console.error("could not restore saved composition", err);
+  }
+  if (broken) setStatus("restore", `${broken} saved automaton(s) no longer parse and are inactive`);
+}
+
+// --- Keyboard ---
+
+const isTyping = (el: EventTarget | null) =>
+  el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement || el instanceof HTMLSelectElement;
+
+const ARROWS: Record<string, [number, number]> = {
+  ArrowLeft: [-1, 0],
+  ArrowRight: [1, 0],
+  ArrowUp: [0, -1],
+  ArrowDown: [0, 1],
 };
 
-startBtn.onclick = () => {
-  if (!getOutput(outputSel.value)) {
-    statusEl.textContent = "Pick a MIDI output first.";
+window.addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey) {
+    // Take over the browser's own zoom shortcuts.
+    if (e.key === "=" || e.key === "+") zoom(1);
+    else if (e.key === "-" || e.key === "_") zoom(-1);
+    // Works while typing in the editor, unlike plain space.
+    else if (e.code === "Space") !e.repeat && togglePlay();
+    else return;
+    e.preventDefault();
+  } else if (e.key === "Escape") {
+    grid.select(null);
+  } else if (isTyping(e.target)) {
     return;
+  } else if (e.key === " ") {
+    e.preventDefault();
+    if (!e.repeat) togglePlay();
+  } else if (e.key in ARROWS) {
+    e.preventDefault();
+    grid.moveSelection(...ARROWS[e.key]);
+  } else if ((e.key === "Backspace" || e.key === "Delete") && grid.selected) {
+    e.preventDefault();
+    world.remove(idsAt(grid.selected));
+    changed();
   }
-  scheduler.start();
-  startBtn.disabled = true;
-  stopBtn.disabled = false;
-};
-
-stopBtn.onclick = () => {
-  scheduler.stop();
-  const out = getOutput(outputSel.value);
-  // Notes up to `lookahead` ms ahead are already queued in the browser, so silence
-  // again once those have gone out.
-  if (out) {
-    panic(out);
-    setTimeout(() => panic(out), scheduler.lookahead + 50);
-  }
-  highlight(null);
-  startBtn.disabled = false;
-  stopBtn.disabled = true;
-};
-
-panicBtn.onclick = () => listOutputs().forEach(panic);
+});
 
 // --- Boot ---
+
+restore();
+showWorld();
+sidebar.show(null);
 
 initMidi(refreshOutputs)
   .then(() => {
     refreshOutputs();
-    statusEl.textContent =
-      "Tip: on macOS, enable the IAC Driver in Audio MIDI Setup and pick it here; in Ableton, enable Track input for it.";
+    panicAll(); // e.g. notes left hanging when the page was reloaded mid-note
+    play();
   })
   .catch((err) => {
     outputSel.replaceChildren(new Option("(MIDI unavailable)", ""));
-    statusEl.textContent = String(err?.message ?? err);
+    setStatus("midi", String(err?.message ?? err));
   });
