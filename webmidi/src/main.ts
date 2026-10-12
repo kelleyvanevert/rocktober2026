@@ -2,8 +2,8 @@ import { initMidi, listOutputs, getOutput, panic, Voices } from "./midi";
 import { Scheduler } from "./scheduler";
 import { Grid, type Cell } from "./grid";
 import { Sidebar } from "./sidebar";
-import { World, cellKey, type View } from "./world";
-import { parse, type Program } from "./lang";
+import { World, cellKey, type Automaton, type View } from "./world";
+import { parse, isCommentedOut, commentOut, uncomment, type Program } from "./lang";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const outputSel = $<HTMLSelectElement>("output");
@@ -264,6 +264,86 @@ function restore() {
   if (broken) setStatus("restore", `${broken} saved automaton(s) no longer parse and are inactive`);
 }
 
+// --- Clipboard ---
+// ⌘C / ⌘X / ⌘V act on all automatons of the selected cell (when not typing). The system
+// clipboard gets their code as text; their full state (value, whether `once` ran) is
+// kept here and used when that same text is pasted back. Any other pasted text becomes
+// a new automaton.
+
+type Copied = Pick<Automaton, "program" | "code" | "value" | "started">;
+let clipboard: { text: string; automatons: Copied[] } | null = null;
+let clipboardTimer = 0;
+
+function flash(message: string) {
+  setStatus("clipboard", message);
+  clearTimeout(clipboardTimer);
+  clipboardTimer = window.setTimeout(() => setStatus("clipboard", null), 2500);
+}
+
+const plural = (n: number) => `${n} automaton${n === 1 ? "" : "s"}`;
+
+function copyCell(e: ClipboardEvent, cut: boolean) {
+  if (isTyping(e.target) || !grid.selected) return;
+  e.preventDefault();
+  const automatons = idsAt(grid.selected)
+    .map((id) => world.get(id))
+    .filter((a) => a !== undefined);
+  if (!automatons.length) return flash("nothing to copy on this cell");
+
+  const text = automatons.map((a) => a.code).join("\n\n");
+  e.clipboardData?.setData("text/plain", text);
+  clipboard = { text, automatons: automatons.map(({ program, code, value, started }) => ({ program, code, value, started })) };
+  if (cut) {
+    world.remove(automatons.map((a) => a.id));
+    changed();
+  }
+  flash(`${cut ? "cut" : "copied"} ${plural(automatons.length)}`);
+}
+
+document.addEventListener("copy", (e) => copyCell(e, false));
+document.addEventListener("cut", (e) => copyCell(e, true));
+
+document.addEventListener("paste", (e) => {
+  if (isTyping(e.target) || !grid.selected) return;
+  e.preventDefault();
+  const { col, row } = grid.selected;
+  const text = e.clipboardData?.getData("text/plain") ?? "";
+
+  if (clipboard && text === clipboard.text) {
+    for (const a of clipboard.automatons) world.add(col, row, a.program, a.code, a.value, a.started);
+    flash(`pasted ${plural(clipboard.automatons.length)}`);
+  } else {
+    try {
+      world.add(col, row, parse(text), text);
+    } catch (err) {
+      return flash(`paste: ${(err as Error).message}`);
+    }
+    flash("pasted text as a new automaton");
+  }
+  changed();
+});
+
+// --- Commenting out ---
+
+/** ⌘/: comment out every automaton on the selected cell, or uncomment if all already are. */
+function toggleComment() {
+  const automatons = idsAt(grid.selected)
+    .map((id) => world.get(id))
+    .filter((a) => a !== undefined);
+  if (!automatons.length) return;
+  const uncommenting = automatons.every((a) => isCommentedOut(a.code));
+  for (const a of automatons) {
+    if (!uncommenting && isCommentedOut(a.code)) continue;
+    a.code = uncommenting ? uncomment(a.code) : commentOut(a.code);
+    try {
+      a.program = parse(a.code);
+    } catch {
+      a.program = []; // was already broken before it got commented out
+    }
+  }
+  changed();
+}
+
 // --- Keyboard ---
 
 const isTyping = (el: EventTarget | null) =>
@@ -283,6 +363,7 @@ window.addEventListener("keydown", (e) => {
     else if (e.key === "-" || e.key === "_") zoom(-1);
     // Works while typing in the editor, unlike plain space.
     else if (e.code === "Space") !e.repeat && togglePlay();
+    else if (e.key === "/" && !isTyping(e.target)) toggleComment();
     else return;
     e.preventDefault();
   } else if (e.key === "Escape") {

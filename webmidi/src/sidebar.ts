@@ -3,8 +3,10 @@
 
 import type { Cell } from "./grid";
 import type { Automaton } from "./world";
+import { FUNCTIONS, SCALES } from "./functions";
+import { isCommentedOut } from "./lang";
 
-const HELP = `click a cell to place an automaton
+const LANGUAGE = `click a cell to place an automaton
 
 step right      move (left/right/up/down)
 step down 2     move two cells
@@ -12,24 +14,56 @@ note c3         play c3 for 1 frame
 note c3 dur 4   ...for 4 frames
 note c3 channel 2   on MIDI channel 2 (default 1)
 every 4 { … }   on every 4th frame
+pattern "x--x-x--" { … }
+                on x frames, rest on - or .
 if hit { … }    another automaton is here
 if hit >= 2 { … } else { … }
 note c3 + hit * 7
                 hit, frame are numbers
 spawn { … }     new automaton, same cell
+spawn spread { … }  one in each of the 8
+                cells around it
 once { … }      only on its first frame
+kill            remove the others on this cell
+morph { … }     give the others on this cell
+                this code instead
 value c3        set own value (starts at 0)
 note value + hitv   hitv: sum of others' values
-note c3 + rand(0, 5)  random int 0-5 (rand = 0-8)
 step up; note c3  ";" separates (optional)
--- comment
+-- comment`;
 
-arrows    move selection
+const KEYS = `arrows    move selection
 ⌫         delete all on cell
+⌘C ⌘X ⌘V  copy / cut / paste cell
+⌘/        comment / uncomment cell
 ⌘↵        create / save
 space     play / pause (⌘space in editor)
 ⌘+ ⌘−     zoom
 esc       leave editor / deselect`;
+
+/** Function and scale reference, generated from functions.ts so it can't go stale. */
+function functionHelp(): string {
+  const lines = ["functions"];
+  for (const { docs } of Object.values(FUNCTIONS)) {
+    for (const [usage, text] of docs) {
+      if (!text) lines.push(usage);
+      else if (usage.length < 16) lines.push(usage.padEnd(16) + text);
+      else lines.push(usage, " ".repeat(16) + text);
+    }
+  }
+  lines.push("", "scales");
+  let line = "";
+  for (const name of Object.keys(SCALES).map((n) => `"${n}"`)) {
+    if (line && (line + " " + name).length > 40) {
+      lines.push(line);
+      line = name;
+    } else line = line ? `${line} ${name}` : name;
+  }
+  lines.push(line);
+  return lines.join("\n");
+}
+
+const HELP = [LANGUAGE, functionHelp(), KEYS].join("\n\n");
 
 export class Sidebar {
   /** These return an error message to show, or null on success. */
@@ -107,7 +141,9 @@ export class Sidebar {
     const here = new Set(ids.filter((id) => this.lookup(id)));
 
     for (const [id, item] of this.items) {
-      item.setValue(this.lookup(id)?.value);
+      const a = this.lookup(id);
+      item.setValue(a?.value);
+      if (a) item.setCode(a.code);
       if (here.has(id)) item.setStatus("");
       else if (item.editing) item.setStatus(this.lookup(id) ? "moved away" : "removed");
       else {
@@ -180,7 +216,7 @@ class Item {
     this.textarea = $("textarea");
     this.error = $(".error");
 
-    this.view.textContent = code || "(empty)";
+    this.showCode();
     this.view.onclick = () => this.edit();
     this.textarea.oninput = () => (this.error.textContent = "");
     bindEditorKeys(this.textarea, () => this.save(), () => this.close());
@@ -191,6 +227,18 @@ class Item {
 
   setStatus(text: string) {
     this.status.textContent = text;
+  }
+
+  /** Code changed elsewhere (e.g. ⌘/); an edit in progress wins. */
+  setCode(code: string) {
+    if (this.editing || code === this.code) return;
+    this.code = code;
+    this.showCode();
+  }
+
+  private showCode() {
+    this.view.textContent = this.code || "(empty)";
+    this.view.classList.toggle("commented", isCommentedOut(this.code));
   }
 
   setValue(value: number | undefined) {
@@ -222,7 +270,7 @@ class Item {
       return;
     }
     this.code = this.textarea.value;
-    this.view.textContent = this.code || "(empty)";
+    this.showCode();
     this.close();
   }
 }

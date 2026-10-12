@@ -2,6 +2,7 @@
 
 import type { Dir, Expr, Program } from "./lang";
 import { noteKey } from "./midi";
+import { FUNCTIONS } from "./functions";
 
 export interface Automaton {
   id: number;
@@ -20,6 +21,8 @@ export interface CellView {
   ids: number[];
   /** Sum of the values of the automatons here, at the start of the frame. */
   valueSum: number;
+  /** How many of them have any code to run (commented-out ones don't). */
+  active: number;
   sounding: boolean;
 }
 
@@ -51,6 +54,13 @@ const DELTA: Record<Dir, [number, number]> = {
   down: [0, 1],
 };
 
+const HERE: [number, number][] = [[0, 0]];
+const NEIGHBOURS: [number, number][] = [
+  [-1, -1], [0, -1], [1, -1],
+  [-1, 0],           [1, 0],
+  [-1, 1],  [0, 1],  [1, 1],
+];
+
 export const cellKey = (col: number, row: number) => `${col},${row}`;
 
 interface Ctx {
@@ -64,7 +74,10 @@ interface Ctx {
   dx: number;
   dy: number;
   notes: [number, number][];
-  spawns: { program: Program; code: string }[];
+  spawns: { program: Program; code: string; spread: boolean }[];
+  kill: boolean;
+  /** Code from the last `morph` block this frame, if any. */
+  morph: { program: Program; code: string } | null;
 }
 
 export class World {
@@ -102,13 +115,18 @@ export class World {
 
   /**
    * Run one frame. Every automaton sees the same starting positions and values (so
-   * `hit` and `hitv` don't depend on evaluation order); moves and spawns are applied afterwards, and anything
-   * that ends up outside `cols` x `rows` is removed.
+   * `hit` and `hitv` don't depend on evaluation order). Moves, spawns, kills and morphs
+   * are applied afterwards. `kill` removes whoever shared the killer's cell at the start
+   * of the frame (so two killers on a cell remove each other); `morph` gives them new
+   * code instead (the oldest morpher wins, and kill beats morph). Then anything that
+   * ended up outside `cols` x `rows` is removed.
    */
   step(cols: number, rows: number): FrameResult {
     const cells = this.occupancy();
     const notes = new Map<number, number>();
     const spawned: Automaton[] = [];
+    const killed = new Set<number>();
+    const morphed = new Map<number, { program: Program; code: string }>();
 
     for (const a of this.automatons) {
       const cell = cells.get(cellKey(a.col, a.row))!;
@@ -122,6 +140,8 @@ export class World {
         dy: 0,
         notes: [],
         spawns: [],
+        kill: false,
+        morph: null,
       };
       exec(a.program, ctx);
       a.value = ctx.value;
@@ -131,15 +151,32 @@ export class World {
         notes.set(note, Math.max(dur, notes.get(note) ?? 0));
         cell.sounding = true;
       }
-      for (const { program, code } of ctx.spawns) {
-        spawned.push({ id: this.nextId++, col: a.col, row: a.row, program, code, value: 0, started: false });
+      for (const { program, code, spread } of ctx.spawns) {
+        for (const [dx, dy] of spread ? NEIGHBOURS : HERE) {
+          const child = { col: a.col + dx, row: a.row + dy, program, code, value: 0, started: false };
+          spawned.push({ id: this.nextId++, ...child });
+        }
+      }
+      for (const id of cell.ids) {
+        if (id === a.id) continue;
+        if (ctx.kill) killed.add(id);
+        // Automatons run oldest first, so the first morph to claim a target is the oldest.
+        if (ctx.morph && !morphed.has(id)) morphed.set(id, ctx.morph);
       }
       a.col += ctx.dx;
       a.row += ctx.dy;
     }
 
-    const room = Math.max(0, MAX_AUTOMATONS - this.automatons.length);
-    this.automatons = this.automatons
+    const survivors = this.automatons.filter((a) => !killed.has(a.id));
+    for (const a of survivors) {
+      const m = morphed.get(a.id);
+      if (!m) continue;
+      a.program = m.program;
+      a.code = m.code;
+      a.started = false; // so the new code's `once` blocks run
+    }
+    const room = Math.max(0, MAX_AUTOMATONS - survivors.length);
+    this.automatons = survivors
       .concat(spawned.slice(0, room))
       .filter((a) => a.col >= 0 && a.row >= 0 && a.col < cols && a.row < rows);
 
@@ -152,7 +189,8 @@ export class World {
     const cells = new Map<string, CellView>();
     for (const a of this.automatons) {
       const k = cellKey(a.col, a.row);
-      const cell = cells.get(k) ?? { ids: [], valueSum: 0, sounding: false };
+      const cell = cells.get(k) ?? { ids: [], valueSum: 0, active: 0, sounding: false };
+      if (a.program.length) cell.active++;
       cell.ids.push(a.id);
       cell.valueSum += a.value;
       cells.set(k, cell);
@@ -179,6 +217,9 @@ function exec(program: Program, ctx: Ctx) {
         }
         break;
       }
+      case "pattern":
+        if (s.steps[ctx.frame % s.steps.length]) exec(s.body, ctx);
+        break;
       case "every": {
         const n = Math.round(evaluate(s.n, ctx));
         if (n > 0 && ctx.frame % n === 0) exec(s.body, ctx);
@@ -189,13 +230,19 @@ function exec(program: Program, ctx: Ctx) {
         else if (s.else) exec(s.else, ctx);
         break;
       case "spawn":
-        ctx.spawns.push({ program: s.body, code: s.source });
+        ctx.spawns.push({ program: s.body, code: s.source, spread: s.spread });
         break;
       case "value":
         ctx.value = evaluate(s.value, ctx);
         break;
       case "once":
         if (ctx.first) exec(s.body, ctx);
+        break;
+      case "morph":
+        ctx.morph = { program: s.body, code: s.source };
+        break;
+      case "kill":
+        ctx.kill = true;
         break;
     }
   }
@@ -209,12 +256,8 @@ function evaluate(e: Expr, ctx: Ctx): number {
       return ctx[e.name];
     case "neg":
       return -evaluate(e.arg, ctx);
-    case "rand": {
-      const a = Math.round(evaluate(e.min, ctx));
-      const b = Math.round(evaluate(e.max, ctx));
-      const [lo, hi] = a <= b ? [a, b] : [b, a];
-      return lo + Math.floor(Math.random() * (hi - lo + 1));
-    }
+    case "call":
+      return FUNCTIONS[e.name].fn(e.args.map((a) => (a.kind === "str" ? a.value : evaluate(a, ctx))));
     case "bin": {
       const a = evaluate(e.left, ctx);
       const b = evaluate(e.right, ctx);

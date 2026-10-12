@@ -4,19 +4,25 @@
 //   stmt    := ("step" | "move") DIR [expr]
 //            | "note" expr (("dur" | "channel") expr)*   -- each option at most once
 //            | "every" expr block
+//            | "pattern" STRING block           -- "x" = run, "-"/"." = rest; " " and "|" ignored
 //            | "if" expr block ["else" (block | if-stmt)]
-//            | "spawn" block
+//            | "spawn" ["spread"] block         -- spread: one in each of the 8 neighbours
+//            | "morph" block                   -- give the others on this cell this code
 //            | "once" block                    -- only on the automaton's first frame
+//            | "kill"                          -- remove the others on this cell
 //            | "value" expr
 //   block   := "{" program "}"
 //   expr    := sum [(">=" | "<=" | ">" | "<" | "==" | "!=") sum]
 //   sum     := product (("+" | "-") product)*
 //   product := unary (("*" | "/" | "%") unary)*
-//   unary   := "-" unary | NUMBER | NOTE | VAR | rand | "(" expr ")"
-//   rand    := "rand" ["(" expr "," expr ")"]   -- random int, both ends inclusive; default 0..8
+//   unary   := "-" unary | NUMBER | NOTE | VAR | call | "(" expr ")"
+//   call    := FUNCTION ["(" arg ("," arg)* ")"]  -- see functions.ts
+//   arg     := expr | STRING
 //   VAR     := "hit" | "hitv" | "value" | "frame"
 //
 // Comments start with "--". Note names use Ableton's convention: c3 = 60.
+
+import { FUNCTIONS } from "./functions";
 
 export type Var = "hit" | "hitv" | "value" | "frame";
 const VARS: string[] = ["hit", "hitv", "value", "frame"] satisfies Var[];
@@ -28,17 +34,23 @@ export type Expr =
   | { kind: "num"; value: number }
   | { kind: "var"; name: Var }
   | { kind: "neg"; arg: Expr }
-  | { kind: "rand"; min: Expr; max: Expr }
+  | { kind: "call"; name: string; args: Arg[] }
   | { kind: "bin"; op: BinOp; left: Expr; right: Expr };
+
+/** Function argument: strings only appear here, and only where a function expects one. */
+export type Arg = Expr | { kind: "str"; value: string };
 
 export type Stmt =
   | { kind: "step"; dir: Dir; count: Expr | null }
   | { kind: "note"; note: Expr; dur: Expr | null; channel: Expr | null }
   | { kind: "every"; n: Expr; body: Program }
+  | { kind: "pattern"; steps: boolean[]; body: Program }
   | { kind: "if"; cond: Expr; then: Program; else: Program | null }
-  | { kind: "spawn"; body: Program; source: string }
+  | { kind: "spawn"; body: Program; source: string; spread: boolean }
+  | { kind: "morph"; body: Program; source: string }
   | { kind: "value"; value: Expr }
-  | { kind: "once"; body: Program };
+  | { kind: "once"; body: Program }
+  | { kind: "kill" };
 
 export type Program = Stmt[];
 
@@ -58,10 +70,10 @@ export function noteNumber(name: string): number | null {
 
 // --- Lexer ---
 
-type Token = { type: "num" | "note" | "ident" | "op" | "eof"; text: string; pos: number };
+type Token = { type: "num" | "note" | "ident" | "op" | "str" | "eof"; text: string; pos: number };
 
 const TOKEN =
-  /(\s+|--[^\n]*)|(\d+(?:\.\d+)?)|([a-gA-G](?:#|b)?-?\d+)(?![\w#])|([a-zA-Z_]\w*)|(>=|<=|==|!=|[-+*/%(){}<>;,])/y;
+  /(\s+|--[^\n]*)|(\d+(?:\.\d+)?)|([a-gA-G](?:#|b)?-?\d+)(?![\w#])|([a-zA-Z_]\w*)|(>=|<=|==|!=|[-+*/%(){}<>;,])|"([^"\n]*)"/y;
 
 function lex(src: string): Token[] {
   const tokens: Token[] = [];
@@ -69,8 +81,13 @@ function lex(src: string): Token[] {
   while (TOKEN.lastIndex < src.length) {
     const pos = TOKEN.lastIndex;
     const m = TOKEN.exec(src);
+    if (!m && src[pos] === '"') throw new ParseError(`${where(src, pos)}: missing closing '"'`);
     if (!m) throw new ParseError(`${where(src, pos)}: unexpected '${src[pos]}'`);
     if (m[1]) continue;
+    if (m[6] !== undefined) {
+      tokens.push({ type: "str", text: m[6], pos });
+      continue;
+    }
     const type = m[2] ? "num" : m[3] ? "note" : m[4] ? "ident" : "op";
     tokens.push({ type, text: m[0], pos });
   }
@@ -143,17 +160,36 @@ export function parse(src: string): Program {
       }
       case "every":
         return { kind: "every", n: expr(), body: block() };
+      case "pattern": {
+        const str = next();
+        if (str.type !== "str") fail(`expected a quoted pattern, e.g. pattern "x---x---" { … }`, str);
+        const steps: boolean[] = [];
+        for (const c of str.text) {
+          if (c === " " || c === "|") continue;
+          if (c !== "x" && c !== "X" && c !== "-" && c !== ".") {
+            fail(`pattern can only contain x (hit) and - or . (rest), not '${c}'`, str);
+          }
+          steps.push(c === "x" || c === "X");
+        }
+        if (!steps.length) fail("pattern is empty", str);
+        return { kind: "pattern", steps, body: block() };
+      }
       case "if":
         return ifStmt();
       case "value":
         return { kind: "value", value: expr() };
       case "once":
         return { kind: "once", body: block() };
-      case "spawn": {
+      case "kill":
+        return { kind: "kill" };
+      case "spawn":
+      case "morph": {
+        const spread = tok.text === "spawn" && accept("spread");
         const open = peek().pos;
         const body = block();
         const close = tokens[i - 1].pos;
-        return { kind: "spawn", body, source: dedent(src.slice(open + 1, close)) };
+        const source = dedent(src.slice(open + 1, close));
+        return tok.text === "spawn" ? { kind: "spawn", body, source, spread } : { kind: "morph", body, source };
       }
       default:
         return fail(`unknown command '${tok.text}'`, tok);
@@ -171,7 +207,7 @@ export function parse(src: string): Program {
   // A trailing count is optional, so only treat unambiguous tokens as its start.
   function startsExpr() {
     const t = peek();
-    return t.type === "num" || t.type === "note" || t.text === "(" || t.text === "rand" || VARS.includes(t.text);
+    return t.type === "num" || t.type === "note" || t.text === "(" || VARS.includes(t.text) || t.text in FUNCTIONS;
   }
 
   function expr(): Expr {
@@ -208,24 +244,72 @@ export function parse(src: string): Program {
     if (tok.type === "num") return { kind: "num", value: Number(tok.text) };
     if (tok.type === "note") return { kind: "num", value: noteNumber(tok.text)! };
     if (VARS.includes(tok.text)) return { kind: "var", name: tok.text as Var };
-    if (tok.text === "rand") {
-      if (!accept("(")) return { kind: "rand", min: { kind: "num", value: 0 }, max: { kind: "num", value: 8 } };
-      const min = expr();
-      expect(",");
-      const max = expr();
-      expect(")");
-      return { kind: "rand", min, max };
-    }
+    if (tok.type === "ident" && tok.text in FUNCTIONS) return call(tok);
     if (/^[a-g](#|b)?$/i.test(tok.text)) fail(`note '${tok.text}' needs an octave, e.g. ${tok.text}3`, tok);
     if (tok.text === "(") {
       const e = expr();
       expect(")");
       return e;
     }
+    if (tok.type === "str") fail(`text "${tok.text}" can only be a function argument, like scale("ionian", …)`, tok);
     return fail(`expected a value but found '${tok.text}'`, tok);
+  }
+
+  function call(tok: Token): Expr {
+    const name = tok.text;
+    const { params, bare } = FUNCTIONS[name];
+    const usage = `${name}(${params.map((p) => p.name).join(", ")})`;
+
+    if (peek().text !== "(") {
+      if (!bare) fail(`${name} needs arguments: ${usage}`, tok);
+      return { kind: "call", name, args: bare!.map((value) => ({ kind: "num", value })) };
+    }
+    next();
+
+    const args: Arg[] = [];
+    if (peek().text !== ")") {
+      do {
+        const param = params[args.length];
+        if (!param) fail(`too many arguments, expected ${usage}`);
+        if (param.type === "string") {
+          const str = next();
+          const value = str.text.toLowerCase();
+          if (str.type !== "str") fail(`expected a quoted ${param.name} for ${usage}, e.g. "${param.choices[0]}"`, str);
+          if (!param.choices.includes(value)) fail(`unknown ${name} ${param.name} "${str.text}"`, str);
+          args.push({ kind: "str", value });
+        } else {
+          args.push(expr());
+        }
+      } while (accept(","));
+    }
+    expect(")");
+    if (args.length !== params.length) fail(`expected ${usage}`, tok);
+    return { kind: "call", name, args };
   }
 
   const result = program("");
   if (peek().type !== "eof") fail(`unexpected '${peek().text}'`);
   return result;
+}
+
+// --- Commenting out (⌘/ on a cell) ---
+
+/** True if every non-blank line is a comment, i.e. the code does nothing. */
+export function isCommentedOut(code: string): boolean {
+  return code.split("\n").every((line) => !line.trim() || line.trimStart().startsWith("--"));
+}
+
+export function commentOut(code: string): string {
+  return code
+    .split("\n")
+    .map((line) => (line.trim() ? `-- ${line}` : line))
+    .join("\n");
+}
+
+/** Removes one level of "--" per line, so comments that were already there survive. */
+export function uncomment(code: string): string {
+  return code
+    .split("\n")
+    .map((line) => line.replace(/^(\s*)-- ?/, "$1"))
+    .join("\n");
 }

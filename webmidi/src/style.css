@@ -183,6 +183,10 @@ body {
   cursor: text;
 }
 
+.automaton pre.code.commented {
+  color: var(--muted);
+}
+
 .automaton pre.code:hover {
   background: #222;
 }

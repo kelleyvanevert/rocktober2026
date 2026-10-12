@@ -125,7 +125,15 @@ export class Grid {
         const x = ox + col * size + gap / 2;
         const y = oy + row * size + gap / 2;
         const c = cells?.get(cellKey(col, row));
-        ctx.fillStyle = !c ? COLORS.empty : c.sounding ? COLORS.sounding : c.ids.length > 1 ? COLORS.many : COLORS.one;
+        ctx.fillStyle = !c
+          ? COLORS.empty
+          : c.sounding
+            ? COLORS.sounding
+            : !c.active
+              ? COLORS.inactive
+              : c.ids.length > 1
+                ? COLORS.many
+                : COLORS.one;
         ctx.beginPath();
         ctx.roundRect(x, y, cell, cell, radius);
         ctx.fill();
@@ -151,6 +159,7 @@ export class Grid {
 const COLORS = {
   bg: "#111",
   empty: "#262626",
+  inactive: "#363636",
   one: "#5a5a5a",
   many: "#8a8a8a",
   sounding: "#ff5a1f",
