@@ -1,0 +1,14 @@
+-- Amen-style break, the classic jungle chop.
+-- In one bar of sixteenths: K.K.S..S.SKKS..S
+
+at x.0.0|2 { note c1 }            -- kicks on 0 and 2
+at x.2.2|3 { note c1 }            -- and the double kick in beat 2
+at x.1.0|3 { note d1 }            -- snares in beat 1 (0-based)
+at x.2.1 { note d1 }
+at x.3.0|3 { note d1 }
+at x.y.1 { note d1 vel r2*25 }    -- ghost snares, half the time
+every 2 { note f#1 vel 40+r40 }
+
+-- every 4th bar: a snare roll over the last beat instead of a crash
+at 4x+3.3 { every 1 { note d1 vel 60+r60 } }
+at 4x.0.0 { note c#2 dur 8 }      -- crash at the top of each 4 bars

@@ -1,0 +1,8 @@
+-- Halftime: same tempo, but the snare only on beat 2 (0-based), so it feels twice as slow.
+
+at x.0.0 { note c1 }
+at 2x+1.1.2 { note c1 vel 80 }            -- extra kick every other bar
+at x.2.0 { note d1 }
+at x.3.3 { note d1 vel r2*30 }            -- sometimes a ghost before the next bar
+every 4 { note f#1 vel 60 }
+at 8x.0.0 { note c#2 dur 16 }             -- crash every 8 bars

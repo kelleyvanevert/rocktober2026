@@ -1,0 +1,7 @@
+-- Plucks in 3s and 5s: a pulse every 3 sixteenths plays random notes from E minor
+-- pentatonic, a pulse every 5 sixteenths (4 per 5/4 bar) plays a low e or b.
+-- They only line up every 15 sixteenths, and with the bar every 60. A bit erratic.
+-- Try an Operator or Drift pluck with a short decay.
+
+every 3 { note e3+r3*5+r2*7 vel 50+r50 }
+every 5 { note e2+r2*7 vel 90 dur 3 }

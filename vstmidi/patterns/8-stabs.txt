@@ -1,0 +1,13 @@
+-- Keys stabs on the offbeats, following the pad's chords. Tidy and tight:
+-- try an Electric (Rhodes) or an organ. The rhythm leans on the drums' 3+2 split.
+
+at x.0|1|3.2 {
+  at 5x { note g3  note b3  note d4  note f#4 }       -- Em9
+  at 5x+1 { note e3  note g3  note b3  note d4 }      -- Cmaj9
+  at 5x+2 { note g3  note b3  note c4  note e4 }      -- Am9
+  at 5x+3 { note f#3  note a3  note b3  note d4 }     -- Bm7
+  at 5x+4 { note f#3  note a3  note d4  note e4 }     -- Dadd9
+}
+
+-- odd bars: one extra stab pushed onto the last sixteenth, into the next bar
+at 2x+1.4.3 { note b3 vel 70  note e4 vel 70 }

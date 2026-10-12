@@ -1,0 +1,47 @@
+[package]
+name = "vstmidi"
+version = "0.1.0"
+edition = "2024"
+description = "A tiny code-based MIDI sequencer plugin, synced to the host's transport"
+
+# Our own workspace (not part of the repo-root one), so nih-plug's dependency
+# tree stays separate from the rocktober crates.
+[workspace]
+members = ["xtask"]
+exclude = ["vendor"]
+
+# egui-baseview with one patch: it doesn't pass "/" on to egui, so Cmd+/ (toggle comment) would
+# never arrive. See the "vstmidi patch" comment in vendor/egui-baseview/src/translate.rs.
+[patch."https://github.com/BillyDM/egui-baseview.git"]
+egui-baseview = { path = "vendor/egui-baseview" }
+
+# nih_plug_egui with one patch: after resizing the window it sized egui's drawing area in points
+# instead of pixels (half the window on Retina). See "vstmidi patch" in vendor/nih_plug_egui.
+[patch."https://github.com/robbert-vdh/nih-plug.git"]
+nih_plug_egui = { path = "vendor/nih_plug_egui" }
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2.7" # same as baseview's, see src/keys.rs
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+# `cargo run --features standalone --release`: opens the plugin as an app, handy for UI work.
+[features]
+standalone = ["nih_plug/standalone"]
+
+[[bin]]
+name = "vstmidi"
+required-features = ["standalone"]
+
+[lints.rust]
+# objc 0.2's msg_send!/sel! check for a "cargo-clippy" feature (see src/keys.rs).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

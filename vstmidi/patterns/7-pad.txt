@@ -1,0 +1,12 @@
+-- Pad: one chord per bar, 5 chords to match the 5-bar drum phrase (5/4).
+-- Em9 | Cmaj9 | Am9 | Bm7 | Dadd9. Try a Wavetable or Drift pad with a slow attack.
+
+at 5x.0.0 { note e2 dur 20 vel 70  note b2 dur 20 vel 70  note f#3 dur 20 vel 70  note g3 dur 20 vel 70  note d4 dur 20 vel 70 }
+at 5x+1.0.0 { note c2 dur 20 vel 70  note g2 dur 20 vel 70  note e3 dur 20 vel 70  note b3 dur 20 vel 70  note d4 dur 20 vel 70 }
+at 5x+2.0.0 { note a1 dur 20 vel 70  note e2 dur 20 vel 70  note c3 dur 20 vel 70  note g3 dur 20 vel 70  note b3 dur 20 vel 70 }
+at 5x+3.0.0 { note b1 dur 20 vel 70  note f#2 dur 20 vel 70  note a2 dur 20 vel 70  note d3 dur 20 vel 70  note f#3 dur 20 vel 70 }
+at 5x+4.0.0 { note d2 dur 20 vel 70  note a2 dur 20 vel 70  note e3 dur 20 vel 70  note f#3 dur 20 vel 70  note a3 dur 20 vel 70 }
+
+-- a soft top note halfway through each bar, picked from E minor pentatonic
+-- (e4 plus 0, 5 or 10, plus 0 or 7: e, a, d, b, e or a)
+at x.2.0 { note e4+r3*5+r2*7 vel 40 dur 12 }

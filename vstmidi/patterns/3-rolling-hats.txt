@@ -1,0 +1,11 @@
+-- Rolling sixteenth hats with the odd open hat, over a two-step.
+
+at x.0.0 { note c1 }
+at x.2.2 { note c1 }
+at x.1|3.0 { note d1 }
+
+every 1 { note f#1 vel 25+r35 }           -- every sixteenth, random velocity
+at x.y.2 { note f#1 vel 70+r20 }          -- accent the offbeats
+at x.y.2 { note a#1 vel r4*90-180 }       -- open hat, 1 in 4 offbeats
+
+-- (r4*90-180 is -180, -90, 0 or 90, and only positive velocities play)

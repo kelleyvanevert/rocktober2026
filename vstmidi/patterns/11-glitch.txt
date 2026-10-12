@@ -1,0 +1,12 @@
+-- Glitch: the most erratic one. Short notes scattered over two and a half octaves of
+-- E minor pentatonic, about 3 in 10 sixteenths. In the last bar of every 5 (where
+-- the drums roll) it goes wild over beats 3 and 4. Try a bell, FM or chip sound.
+
+-- vel r10*25-150: 0 or less (silent) for r10 up to 6, then 25, 50 or 75
+every 1 { note e3+r3*5+r2*7+r2*12 vel r10*25-150 }
+
+-- the wild bit: every sixteenth, half the time
+at 5x+4.3|4 { note e3+r3*5+r2*7+r2*12 vel r2*100 }
+
+-- now and then a long, low note underneath, on the "and" of beat 0
+at x.0.2 { note e2+r2*7 vel r4*90-180 dur 8 }
